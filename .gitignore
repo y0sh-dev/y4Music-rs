@@ -1,0 +1,27 @@
+# --- Rust Artifacts ---
+/target/
+/.idea/
+Cargo.lock
+
+# --- Storage / Databases ---
+# Block SQLite databases and transaction logs anywhere in the workspace
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# --- Backup & Temporary Files ---
+src/**/*.rs.bak
+*.bak
+*.tmp
+
+# --- Neovim / Editor Junk ---
+*.swp
+*.swo
+*~
+*.un~
+Session.vim
+
+# --- OS Junk ---
+.DS_Store
+Thumbs.db
+
