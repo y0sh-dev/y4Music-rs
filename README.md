@@ -5,7 +5,7 @@
 
 ![Language](https://img.shields.io/badge/language-Rust-orange.svg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Docs](https://img.shields.io/badge/docs-00__overview.md-blueviolet.svg)](doc/00_overview.md)
+[![Docs](https://img.shields.io/badge/docs-00__overview.md-blueviolet.svg)](docs/00_overview.md)
 [![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/y0sh-dev/y4Music-rs/releases/latest)
 
 <br>
