@@ -76,5 +76,4 @@ For deeper insights into the design intentions behind the code—such as how see
 ## License
 
 This project is licensed under the MIT License. See the `LICENSE` file for details.
-```
 
