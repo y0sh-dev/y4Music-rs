@@ -1,0 +1,25 @@
+[Unit]
+Description=y4Music-rs Discord Music Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=y4music
+Group=y4music
+WorkingDirectory=/var/lib/y4music-rs
+ExecStart=/usr/local/bin/y4music-rs
+EnvironmentFile=/etc/y4music-rs/.env
+
+# Auto-restart settings
+Restart=always
+RestartSec=5
+
+# Security settings
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
