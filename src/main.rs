@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Load `.env` if present: current directory first, then the FHS system
     // config path. Neither being present is not fatal.
-    const SYSTEM_ENV_PATH: &str = "/etc/y1music-bot/.env";
+    const SYSTEM_ENV_PATH: &str = "/etc/y4music-rs/.env";
     match dotenvy::dotenv() {
         Ok(path) => tracing::info!("Loaded config from {}", path.display()),
         Err(_) if std::path::Path::new(SYSTEM_ENV_PATH).exists() => {
@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
     let token = std::env::var("DISCORD_TOKEN")
         .map_err(|_| anyhow::anyhow!("DISCORD_TOKEN is not set (see .env.example)"))?;
     let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite:///var/lib/y1music-bot/data.db".to_string());
+        .unwrap_or_else(|_| "sqlite:///var/lib/y4music-rs/data.db".to_string());
     let test_guild_id = std::env::var("TEST_GUILD_ID")
         .ok()
         .and_then(|s| s.parse::<u64>().ok());

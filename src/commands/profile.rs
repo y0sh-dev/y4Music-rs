@@ -19,30 +19,32 @@ pub async fn profile(_ctx: Context<'_>) -> Result<(), Error> {
 }
 
 /// Loads a user's profile from the DB, inserting the default row on first
-/// use. Raw-parameter version so callers without a poise `Context` can use it.
+/// use. Raw-parameter version so callers without a poise `Context` can use
+/// it. The insert-then-select is a single atomic upsert (`ON CONFLICT ...
+/// DO NOTHING`), so two concurrent first-time calls for the same user can't
+/// race each other into a unique-constraint violation.
 pub(crate) async fn load_or_create_raw(
     db: &SqlitePool,
     user_id: i64,
 ) -> Result<UserProfile, Error> {
-    if let Some(profile) = sqlx::query_as::<_, UserProfile>(
+    let defaults = UserProfile::default_for(user_id);
+    sqlx::query(
+        "INSERT INTO users (user_id, default_volume, default_eq_mode) VALUES (?, ?, ?) \
+         ON CONFLICT (user_id) DO NOTHING",
+    )
+    .bind(defaults.user_id)
+    .bind(defaults.default_volume)
+    .bind(&defaults.default_eq_mode)
+    .execute(db)
+    .await?;
+
+    sqlx::query_as::<_, UserProfile>(
         "SELECT user_id, default_volume, default_eq_mode FROM users WHERE user_id = ?",
     )
     .bind(user_id)
-    .fetch_optional(db)
-    .await?
-    {
-        return Ok(profile);
-    }
-
-    let defaults = UserProfile::default_for(user_id);
-    sqlx::query("INSERT INTO users (user_id, default_volume, default_eq_mode) VALUES (?, ?, ?)")
-        .bind(defaults.user_id)
-        .bind(defaults.default_volume)
-        .bind(&defaults.default_eq_mode)
-        .execute(db)
-        .await?;
-
-    Ok(defaults)
+    .fetch_one(db)
+    .await
+    .map_err(Into::into)
 }
 
 async fn load_or_create(ctx: &Context<'_>, user_id: i64) -> Result<UserProfile, Error> {
