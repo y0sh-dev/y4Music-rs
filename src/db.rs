@@ -16,7 +16,11 @@ pub async fn init(database_url: &str) -> anyhow::Result<SqlitePool> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
+    let options = SqliteConnectOptions::from_str(database_url)?
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .foreign_keys(true)
+        .busy_timeout(std::time::Duration::from_secs(5));
 
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
