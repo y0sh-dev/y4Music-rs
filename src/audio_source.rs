@@ -17,6 +17,10 @@ use songbird::input::{AudioStream, AudioStreamError, ChildContainer, Compose, In
 const RAW_SAMPLE_RATE: u32 = 48_000;
 const RAW_CHANNELS: u32 = 2;
 
+/// Upper bound on the `yt-dlp -j` stream-URL resolution call, so a network
+/// stall can't block a track from ever starting (or ending) forever.
+const YTDLP_RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Lazily resolves `url` to a direct CDN stream URL, then spawns `ffmpeg` to
 /// fetch it and apply the EQ filter, handing songbird the resulting raw PCM.
 #[derive(Clone, Debug)]
@@ -65,8 +69,8 @@ impl From<FfmpegEqSource> for Input {
 /// Runs a metadata-only `yt-dlp -j` lookup and extracts a direct,
 /// ffmpeg-fetchable stream URL from its JSON output.
 async fn resolve_stream_url(url: &str, extra_args: &[String]) -> Result<String, AudioStreamError> {
-    let output = tokio::process::Command::new("yt-dlp")
-        .args(extra_args)
+    let mut cmd = tokio::process::Command::new("yt-dlp");
+    cmd.args(extra_args)
         .args([
             "-f",
             "bestaudio/best",
@@ -77,8 +81,21 @@ async fn resolve_stream_url(url: &str, extra_args: &[String]) -> Result<String, 
             url,
         ])
         .stdin(Stdio::null())
-        .output()
+        // Ensure a timed-out process is actually killed, not just abandoned
+        // to keep running in the background after we stop waiting on it.
+        .kill_on_drop(true);
+
+    let output = tokio::time::timeout(YTDLP_RESOLVE_TIMEOUT, cmd.output())
         .await
+        .map_err(|_| {
+            AudioStreamError::Fail(
+                format!(
+                    "yt-dlp timed out after {}s resolving a stream URL",
+                    YTDLP_RESOLVE_TIMEOUT.as_secs()
+                )
+                .into(),
+            )
+        })?
         .map_err(|e| AudioStreamError::Fail(format!("failed to spawn yt-dlp: {e}").into()))?;
 
     if !output.status.success() {
@@ -211,9 +228,14 @@ async fn spawn_pipeline(
 }
 
 /// Forwards a child process's stderr into `tracing`, tagged by `label`, one
-/// line at a time, on a plain OS thread.
+/// line at a time. Runs on tokio's blocking-task pool (bounded, reused)
+/// rather than a raw `std::thread::spawn`, so repeated track starts/seeks
+/// can't exhaust the OS thread limit -- `ffmpeg`'s stdout still has to go
+/// through a `std::process::Child` for `ChildContainer` (see this module's
+/// doc comment), so its stderr stays a blocking `std::process::ChildStderr`
+/// too; there is no plain `Child`-compatible async read for it.
 fn log_stderr_lines(label: &'static str, stderr: ChildStderr) {
-    std::thread::spawn(move || {
+    tokio::task::spawn_blocking(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             if !line.trim().is_empty() {
                 tracing::warn!("[{label}] {line}");

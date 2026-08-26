@@ -1,9 +1,15 @@
 //! Minimal `yt-dlp` JSON wrapper for search and playlist-URL expansion.
 
+use std::time::Duration;
+
 use serde_json::Value;
 use tokio::process::Command;
 
 use crate::Error;
+
+/// Upper bound on a single `yt-dlp` metadata lookup, so a network stall
+/// can't block a command handler (or leak its task) forever.
+const YTDLP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A single track's metadata, as needed by search results and playlists.
 #[derive(Debug, Clone)]
@@ -16,11 +22,18 @@ pub struct TrackInfo {
 }
 
 async fn run_yt_dlp(args: &[&str]) -> Result<Vec<Value>, Error> {
-    let output = Command::new("yt-dlp")
-        .args(["--no-warnings", "-j"])
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args(["--no-warnings", "-j"])
         .args(args)
-        .output()
+        // Ensure a timed-out process is actually killed, not just abandoned
+        // to keep running in the background after we stop waiting on it.
+        .kill_on_drop(true);
+
+    let output = tokio::time::timeout(YTDLP_TIMEOUT, cmd.output())
         .await
+        .map_err(|_| -> Error {
+            format!("yt-dlp timed out after {}s.", YTDLP_TIMEOUT.as_secs()).into()
+        })?
         .map_err(|e| -> Error {
             if e.kind() == std::io::ErrorKind::NotFound {
                 "yt-dlp is not installed or not on PATH.".into()
