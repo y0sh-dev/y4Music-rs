@@ -96,3 +96,68 @@ The output of `FfmpegEqSource` is wrapped in a `ReadOnlySource`, which always re
 ## Bonus: ffmpeg's stderr is the only clue to error causes
 
 `ffmpeg` is started with `-loglevel error` and is almost silent during normal operation. `log_stderr_lines` forwards the child process's stderr line by line to `tracing::warn!` on a separate thread (synchronous `Read` requiring no tokio runtime). Generic errors returned by symphonia like "no compatible track found" do not explain the cause, so when tracking down "playback fails for some reason" in production, these logs are practically the only clue.
+
+## Streaming Import for Large Playlists
+
+### The Problem: Bulk waiting times out on hundreds of tracks
+
+The old `ytdlp::resolve` used by `/playlist_add` and `/serverplaylist_add` was a single path that waited for the entire output of `yt-dlp -j` via `Command::output()` before returning a `Vec<TrackInfo>`. While this finishes in seconds for a few dozen tracks, enumerating hundreds or thousands of tracks in a playlist takes time and hits the command handler's timeout. Because the design was "accumulate everything into a Vec in memory before writing to the DB", the start of the write process itself was delayed until the enumeration was complete.
+
+### `TrackStream`: Asynchronous parsing "line by line" instead of the whole process
+
+`TrackStream` in `ytdlp.rs` spawns `yt-dlp -j --flat-playlist --ignore-errors <query>` via `tokio::process::Command` and holds its `stdout` as `tokio::io::Lines<BufReader<ChildStdout>>`.
+
+```text
+tokio::process::Command::spawn()
+     │
+     ▼
+ChildStdout (Asynchronous pipe)
+     │  BufReader::new(..).lines()
+     ▼
+Lines<BufReader<ChildStdout>>
+     │  .next_line().await  ← 1 line = 1 track's JSON
+     ▼
+TrackStream::next_track() returns TrackInfo one by one
+```
+
+Because `next_track` reads and parses only one line each time it is called, the period of "waiting for `yt-dlp` to finish enumerating everything" simply does not exist. The moment the first track is found, the caller (`playlist::import_tracks_from_stream`, described below) can already start writing to the DB.
+
+### Why the timeout unit was changed from "entire process" to "until the next line"
+
+`run_yt_dlp` (the bulk-wait path used by `search`) applies `YTDLP_TIMEOUT` (20 seconds) to the **entire process**. This is incompatible with the premise that "larger playlists take more time" — enumerating thousands of tracks might take more than 20 seconds not because of a network stall, but simply because of the scale, yet it would be uniformly failed.
+
+Instead, `TrackStream::next_track` applies `NEXT_LINE_TIMEOUT` (15 seconds) only to the **reading of a single line**.
+
+```rust
+let line = tokio::time::timeout(NEXT_LINE_TIMEOUT, self.lines.next_line()).await??;
+```
+
+This allows the process to take as long as it needs for the fact that "the playlist itself is large", while still detecting and timing out only on network stalls or `yt-dlp` hangs, which manifest as "the next line hasn't arrived even after 15 seconds".
+
+### Ignoring stderr blocks `yt-dlp` itself
+
+`--ignore-errors` skips deleted or private videos in a playlist and continues processing, but it writes a warning to stderr for every skip. The OS pipe buffer is finite (typically around 64KB), so if left unread, the warnings accumulate and fill the buffer, at which point `yt-dlp`'s own writing to stderr blocks. `next_track` is waiting on stdout, but if the same process's stderr is clogged, the entire process halts, directly leading to a deadlock on the stdout reading side.
+
+As a countermeasure, `TrackStream::spawn` also receives stderr via `Stdio::piped()`, and a separate task spawned by `tokio::spawn` (`log_stderr_lines`) continuously forwards it line by line to `tracing::warn!`. Since it runs independently of the `next_track` loop on the stdout side, consuming stderr does not hinder stdout reading.
+
+### Process Cleanup: The two-stage defense of `kill_on_drop` and `Drop`
+
+`Command::kill_on_drop(true)` is set at the time of `TrackStream::spawn`, while `TrackStream` itself also implements `Drop` to call `child.start_kill()`. The former is a mechanism provided by the tokio runtime to "kill when the handle is dropped", and the latter is an explicit insurance policy — ensuring that even if the stream is discarded before being fully read due to an early `?` return, no `yt-dlp` process is ever left behind.
+
+## Importing into Playlists: Chunked Bulk Insert
+
+The tracks returned one by one by `TrackStream` are received and written to the DB by `playlist::import_tracks_from_stream` (`playlist.rs`). Here too, both extremes of "INSERT per item" and "combining everything into one giant INSERT" are avoided.
+
+```text
+TrackStream::next_track() ──1 by 1──▶ Vec<TrackInfo> Buffer
+                                            │ Every 100 items
+                                            ▼
+                          Multi-row INSERT via sqlx::QueryBuilder
+                                            │
+                                            ▼
+              (This entire loop is bundled into one db.begin() ~ tx.commit())
+```
+
+Every 100 items (`IMPORT_CHUNK_SIZE`), `sqlx::QueryBuilder` assembles and executes "100 rows of `VALUES (...), (...), ...` in a single INSERT statement", and then clears the buffer. SQLite has an upper limit on the number of parameters that can be bound to a single SQL statement (typically hundreds to tens of thousands depending on the version), so combining an entire playlist (up to `MAX_BULK_ADD` = 1000 tracks, 6 columns = max 6000 parameters) into a single statement risks exceeding the limit depending on the environment. Dividing it into units of 100 reliably avoids this limit while requiring far fewer DB round trips than inserting one by one.
+
+The reason `import_tracks_from_stream` as a whole (from the first `db.begin()` to the final `tx.commit()`) is wrapped in a single transaction, rather than committing per chunk, is for consistency. Even if an error occurs midway through enumeration, as long as it is before the commit, the already-inserted chunks are rolled back together, ensuring that a half-baked state like "only the first half of the playlist was added" is never left in the DB.
