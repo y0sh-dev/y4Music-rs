@@ -41,10 +41,18 @@ pub fn sweep_stale(sessions: &SearchSessions) {
 
 mod ids {
     pub const SELECT: &str = "search:select";
-    pub const PAGE_PREFIX: &str = "search:page:";
+    // Distinct prefixes for Prev/Next so their `custom_id`s never collide --
+    // with a single page, both buttons would otherwise target page 0 and
+    // produce an identical `custom_id`, which Discord rejects with 400.
+    pub const PREFIX_PREV: &str = "search:prev:";
+    pub const PREFIX_NEXT: &str = "search:next:";
 
-    pub fn page(n: usize) -> String {
-        format!("{PAGE_PREFIX}{n}")
+    pub fn prev(n: usize) -> String {
+        format!("{PREFIX_PREV}{n}")
+    }
+
+    pub fn next(n: usize) -> String {
+        format!("{PREFIX_NEXT}{n}")
     }
 }
 
@@ -108,11 +116,11 @@ fn build_components(tracks: &[TrackInfo], page: usize) -> Vec<serenity::CreateAc
     .placeholder("Select a track to play...");
 
     let pages = total_pages(tracks);
-    let prev = serenity::CreateButton::new(ids::page(page.saturating_sub(1)))
+    let prev = serenity::CreateButton::new(ids::prev(page.saturating_sub(1)))
         .label("⏪ Previous")
         .style(serenity::ButtonStyle::Secondary)
         .disabled(page == 0);
-    let next = serenity::CreateButton::new(ids::page((page + 1).min(pages.saturating_sub(1))))
+    let next = serenity::CreateButton::new(ids::next((page + 1).min(pages.saturating_sub(1))))
         .label("Next ⏩")
         .style(serenity::ButtonStyle::Secondary)
         .disabled(page + 1 >= pages);
@@ -178,7 +186,10 @@ pub async fn handle_component_interaction(
 
     if custom_id == ids::SELECT {
         handle_select(ctx, interaction, data).await
-    } else if let Some(rest) = custom_id.strip_prefix(ids::PAGE_PREFIX) {
+    } else if let Some(rest) = custom_id
+        .strip_prefix(ids::PREFIX_PREV)
+        .or_else(|| custom_id.strip_prefix(ids::PREFIX_NEXT))
+    {
         let page: usize = rest.parse().unwrap_or(0);
         handle_page(ctx, interaction, data, page).await
     } else {
