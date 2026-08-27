@@ -1,10 +1,21 @@
 //! Playlist CRUD and permissions, backed by SQLite.
 
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use crate::Error;
 use crate::models::{Collaborator, Playlist, PlaylistTrack};
-use crate::ytdlp::TrackInfo;
+use crate::ytdlp::{TrackInfo, TrackStream};
+
+/// Ceiling on how many tracks a single `/playlist_add` /
+/// `/serverplaylist_add` import may add, enforced while streaming (see
+/// `import_tracks_from_stream`) rather than by resolving the whole source
+/// up front.
+pub const MAX_BULK_ADD: usize = 1000;
+
+/// Rows buffered before each chunked bulk insert in
+/// `import_tracks_from_stream`, so a single `INSERT`'s parameter count
+/// stays bounded regardless of playlist size.
+const IMPORT_CHUNK_SIZE: usize = 100;
 
 /// Whether `err` is a `UNIQUE` constraint violation.
 fn is_unique_violation(err: &sqlx::Error) -> bool {
@@ -161,16 +172,64 @@ pub async fn tracks(db: &SqlitePool, playlist_id: i64) -> Result<Vec<PlaylistTra
     .await?)
 }
 
-/// Appends tracks to the end of a playlist, returning how many were added.
+/// Outcome of `import_tracks_from_stream`.
+pub struct ImportResult {
+    /// How many tracks were inserted.
+    pub imported: usize,
+    /// Whether the source had more tracks than `MAX_BULK_ADD` that were
+    /// left unread once the cap was hit.
+    pub truncated: bool,
+}
+
+/// Drains `stream` into `playlist_id`, in two phases kept strictly
+/// separate so a slow network fetch never holds a DB write lock:
+///
+/// 1. **Receive phase**: no transaction is open. `stream.next_track()` is
+///    polled in a loop (this is where the network I/O happens) and results
+///    are collected into memory, up to `MAX_BULK_ADD`.
+/// 2. **Write phase**: only once receiving is done does this open a
+///    transaction, insert the collected tracks in `IMPORT_CHUNK_SIZE`-row
+///    batches (via `sqlx::QueryBuilder`), and commit. With nothing left to
+///    wait on, this phase is fast, so the write lock it holds is brief.
+///
+/// An earlier version opened the transaction before the receive loop,
+/// which held SQLite's write lock for the entire (potentially
+/// tens-of-seconds) network-bound import and starved other guilds'
+/// unrelated DB operations with `SQLITE_BUSY`.
+///
 /// Does not itself check permissions -- callers check `has_permission`
 /// first.
-pub async fn add_tracks(
+pub async fn import_tracks_from_stream(
     db: &SqlitePool,
     playlist_id: i64,
-    new_tracks: &[TrackInfo],
-) -> Result<usize, Error> {
-    let mut tx = db.begin().await?;
+    stream: &mut TrackStream,
+) -> Result<ImportResult, Error> {
+    // Receive phase -- network-bound, no DB lock held.
+    let mut buffer: Vec<TrackInfo> = Vec::new();
+    let mut truncated = false;
+    loop {
+        if buffer.len() >= MAX_BULK_ADD {
+            // Peek one more to tell "stream ended right at the cap" apart
+            // from "there was more we chose not to read".
+            truncated = stream.next_track().await?.is_some();
+            break;
+        }
+        match stream.next_track().await? {
+            Some(track) => buffer.push(track),
+            None => break,
+        }
+    }
 
+    let imported = buffer.len();
+    if imported == 0 {
+        return Ok(ImportResult {
+            imported: 0,
+            truncated,
+        });
+    }
+
+    // Write phase -- DB-bound, held only as long as the chunked inserts take.
+    let mut tx = db.begin().await?;
     let mut next_order: i64 = sqlx::query_scalar(
         "SELECT COALESCE(MAX(added_order) + 1, 0) FROM playlist_tracks WHERE playlist_id = ?",
     )
@@ -178,24 +237,39 @@ pub async fn add_tracks(
     .fetch_one(&mut *tx)
     .await?;
 
-    for track in new_tracks {
-        sqlx::query(
-            "INSERT INTO playlist_tracks (playlist_id, url, title, uploader, duration, added_order) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(playlist_id)
-        .bind(&track.webpage_url)
-        .bind(&track.title)
-        .bind(&track.uploader)
-        .bind(track.duration)
-        .bind(next_order)
-        .execute(&mut *tx)
-        .await?;
-        next_order += 1;
+    for chunk in buffer.chunks(IMPORT_CHUNK_SIZE) {
+        insert_chunk(&mut tx, playlist_id, chunk, next_order).await?;
+        next_order += chunk.len() as i64;
     }
 
     tx.commit().await?;
-    Ok(new_tracks.len())
+    Ok(ImportResult {
+        imported,
+        truncated,
+    })
+}
+
+/// Bulk-inserts one chunk of tracks via `QueryBuilder`, `added_order`
+/// starting at `start_order`.
+async fn insert_chunk(
+    tx: &mut Transaction<'_, Sqlite>,
+    playlist_id: i64,
+    chunk: &[TrackInfo],
+    start_order: i64,
+) -> Result<(), Error> {
+    let mut builder = sqlx::QueryBuilder::new(
+        "INSERT INTO playlist_tracks (playlist_id, url, title, uploader, duration, added_order) ",
+    );
+    builder.push_values(chunk.iter().enumerate(), |mut row, (i, track)| {
+        row.push_bind(playlist_id)
+            .push_bind(&track.webpage_url)
+            .push_bind(&track.title)
+            .push_bind(&track.uploader)
+            .push_bind(track.duration)
+            .push_bind(start_order + i as i64);
+    });
+    builder.build().execute(&mut **tx).await?;
+    Ok(())
 }
 
 /// Removes the `index`-th (1-based) track from a playlist, returning it if
@@ -209,22 +283,36 @@ pub async fn remove_track(
         return Ok(None);
     }
 
+    let mut tx = db.begin().await?;
+
     let track = sqlx::query_as::<_, PlaylistTrack>(
         "SELECT id, playlist_id, url, title, uploader, duration, added_order \
          FROM playlist_tracks WHERE playlist_id = ? ORDER BY added_order LIMIT 1 OFFSET ?",
     )
     .bind(playlist_id)
     .bind(index_1based - 1)
-    .fetch_optional(db)
+    .fetch_optional(&mut *tx)
     .await?;
 
     if let Some(track) = &track {
         sqlx::query("DELETE FROM playlist_tracks WHERE id = ?")
             .bind(track.id)
-            .execute(db)
+            .execute(&mut *tx)
             .await?;
+
+        // Close the gap left by the deleted row so `added_order` stays a
+        // dense, gapless sequence.
+        sqlx::query(
+            "UPDATE playlist_tracks SET added_order = added_order - 1 \
+             WHERE playlist_id = ? AND added_order > ?",
+        )
+        .bind(playlist_id)
+        .bind(track.added_order)
+        .execute(&mut *tx)
+        .await?;
     }
 
+    tx.commit().await?;
     Ok(track)
 }
 
@@ -294,18 +382,17 @@ pub fn has_permission(
         .any(|c| c.user_id == Some(user_id) || c.role_id.is_some_and(|rid| role_ids.contains(&rid)))
 }
 
-/// Toggles a server playlist's lock, returning the new state.
-pub async fn toggle_lock(
-    db: &SqlitePool,
-    playlist_id: i64,
-    currently_locked: bool,
-) -> Result<bool, Error> {
-    let new_state = !currently_locked;
-    sqlx::query("UPDATE playlists SET locked = ? WHERE id = ?")
-        .bind(new_state)
-        .bind(playlist_id)
-        .execute(db)
-        .await?;
+/// Atomically toggles a server playlist's lock and returns the new state.
+/// The flip happens in SQL (`NOT locked`) rather than being computed from a
+/// value read earlier, so two concurrent toggles can't race each other into
+/// the same end state.
+pub async fn toggle_lock(db: &SqlitePool, playlist_id: i64) -> Result<bool, Error> {
+    let new_state: bool = sqlx::query_scalar(
+        "UPDATE playlists SET locked = NOT locked WHERE id = ? RETURNING locked",
+    )
+    .bind(playlist_id)
+    .fetch_one(db)
+    .await?;
     Ok(new_state)
 }
 

@@ -28,11 +28,19 @@ pub struct ListSession {
 pub type ListSessions = DashMap<serenity::MessageId, ListSession>;
 
 mod ids {
-    pub const PREFIX: &str = "listpage:";
+    // Distinct prefixes for Prev/Next so their `custom_id`s never collide --
+    // with a single page, both buttons would otherwise target page 0 and
+    // produce an identical `custom_id`, which Discord rejects with 400.
+    pub const PREFIX_PREV: &str = "listpage:prev:";
+    pub const PREFIX_NEXT: &str = "listpage:next:";
     pub const NOOP: &str = "listpage:noop";
 
-    pub fn page(n: usize) -> String {
-        format!("{PREFIX}{n}")
+    pub fn prev(n: usize) -> String {
+        format!("{PREFIX_PREV}{n}")
+    }
+
+    pub fn next(n: usize) -> String {
+        format!("{PREFIX_NEXT}{n}")
     }
 }
 
@@ -61,7 +69,7 @@ fn build_components(lines: &[String], page: usize) -> Vec<serenity::CreateAction
     let pages = total_pages(lines);
     let page = page.min(pages.saturating_sub(1));
     vec![serenity::CreateActionRow::Buttons(vec![
-        serenity::CreateButton::new(ids::page(page.saturating_sub(1)))
+        serenity::CreateButton::new(ids::prev(page.saturating_sub(1)))
             .label("⏪")
             .style(serenity::ButtonStyle::Secondary)
             .disabled(page == 0),
@@ -69,21 +77,25 @@ fn build_components(lines: &[String], page: usize) -> Vec<serenity::CreateAction
             .label(format!("Page {}/{pages}", page + 1))
             .style(serenity::ButtonStyle::Secondary)
             .disabled(true),
-        serenity::CreateButton::new(ids::page((page + 1).min(pages.saturating_sub(1))))
+        serenity::CreateButton::new(ids::next((page + 1).min(pages.saturating_sub(1))))
             .label("⏩")
             .style(serenity::ButtonStyle::Secondary)
             .disabled(page + 1 >= pages),
     ])]
 }
 
-/// Sends a new paginated list as an ephemeral reply, and registers its
-/// session so later Prev/Next presses can look the full list back up.
+/// Sends a new paginated list, and registers its session so later
+/// Prev/Next presses can look the full list back up. `ephemeral` controls
+/// visibility of the reply -- personal listings (playlists, search
+/// results) pass `true`; a shared listing everyone in the channel should
+/// see (e.g. `/queue`) passes `false`.
 pub async fn send_paginated(
     ctx: &Context<'_>,
     title: String,
     color: serenity::Colour,
     lines: Vec<String>,
     footer: String,
+    ephemeral: bool,
 ) -> Result<(), Error> {
     let session = ListSession {
         title,
@@ -100,7 +112,7 @@ pub async fn send_paginated(
             poise::CreateReply::default()
                 .embed(embed)
                 .components(components)
-                .ephemeral(true),
+                .ephemeral(ephemeral),
         )
         .await?;
     let message_id = reply.message().await?.id;
@@ -116,7 +128,12 @@ pub async fn handle_component_interaction(
     interaction: &serenity::ComponentInteraction,
     data: &Data,
 ) -> Result<(), Error> {
-    let Some(rest) = interaction.data.custom_id.strip_prefix(ids::PREFIX) else {
+    let Some(rest) = interaction
+        .data
+        .custom_id
+        .strip_prefix(ids::PREFIX_PREV)
+        .or_else(|| interaction.data.custom_id.strip_prefix(ids::PREFIX_NEXT))
+    else {
         return Ok(());
     };
     let Ok(page) = rest.parse::<usize>() else {

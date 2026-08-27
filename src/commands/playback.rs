@@ -163,10 +163,10 @@ pub(crate) async fn ensure_call(ctx: &Context<'_>) -> Result<Arc<TokioMutex<Call
     .await
 }
 
-/// Raw-parameter version of `enqueue_known`, for call sites without a poise
-/// `Context`. Applies `requested_by`'s saved volume/EQ. `uploader` and
-/// `requester_name` populate the Now Playing panel's text; pass
-/// `uploader: None` if unknown.
+/// Enqueues a single track whose title/duration are already known, for call
+/// sites without a poise `Context` (currently `commands::search`). Applies
+/// `requested_by`'s saved volume/EQ. `uploader` and `requester_name`
+/// populate the Now Playing panel's text; pass `uploader: None` if unknown.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn enqueue_known_raw(
     extra_args: &[String],
@@ -205,31 +205,48 @@ pub(crate) async fn enqueue_known_raw(
     Ok(())
 }
 
-/// Enqueues a track whose title/duration are already known (e.g. a stored
-/// playlist row or `/search` result), skipping the metadata lookup `/play`
-/// needs. Shared by `commands::playlist` and `commands::server_playlist`.
-pub(crate) async fn enqueue_known(
+/// Enqueues many known tracks (e.g. a whole stored playlist) at once.
+/// Unlike calling `enqueue_known_raw` in a loop, this resolves
+/// `requested_by`'s saved volume/EQ exactly once and acquires `call`'s lock
+/// exactly once for the entire batch, instead of once per track. Shared by
+/// `commands::playlist::playlist_play` and
+/// `commands::server_playlist::serverplaylist_play`.
+pub(crate) async fn enqueue_multiple_known(
     ctx: &Context<'_>,
     call: &Arc<TokioMutex<Call>>,
-    url: &str,
-    title: &str,
-    duration_secs: i64,
+    tracks: &[crate::models::PlaylistTrack],
     requested_by: serenity::UserId,
-    uploader: Option<String>,
 ) -> Result<(), Error> {
-    enqueue_known_raw(
-        &ctx.data().ytdlp_extra_args,
-        &ctx.data().db,
-        &ctx.data().eq_hifi_filter,
-        call,
-        url,
-        title,
-        duration_secs,
-        requested_by,
-        ctx.author().display_name().to_string(),
-        uploader,
-    )
-    .await
+    let db = &ctx.data().db;
+    let volume = resolve_saved_volume(db, requested_by).await;
+    let eq_filter = resolve_eq_filter(db, requested_by, &ctx.data().eq_hifi_filter).await;
+    let extra_args = &ctx.data().ytdlp_extra_args;
+    let requester_name = ctx.author().display_name().to_string();
+
+    let mut call = call.lock().await;
+    for track in tracks {
+        let source = FfmpegEqSource {
+            url: track.url.clone(),
+            ytdlp_extra_args: extra_args.clone(),
+            eq_filter: eq_filter.clone(),
+            seek_time: None,
+        };
+        let meta = Arc::new(TrackMeta {
+            title: track.title.clone(),
+            url: track.url.clone(),
+            requested_by,
+            duration: (track.duration > 0).then(|| Duration::from_secs(track.duration as u64)),
+            eq_filter: eq_filter.clone(),
+            thumbnail: derive_youtube_thumbnail(&track.url),
+            uploader: track.uploader.clone(),
+            requester_name: requester_name.clone(),
+            start_offset: Duration::ZERO,
+            is_seek: false,
+        });
+        let built = Track::new_with_data(source.into(), meta).volume(volume);
+        call.enqueue(built).await;
+    }
+    Ok(())
 }
 
 /// Joins your current voice channel.
@@ -642,6 +659,13 @@ pub async fn loop_cmd(
 }
 
 /// Displays the current song queue.
+///
+/// Uses `pagination::send_paginated` (10 tracks/page) rather than a single
+/// `CreateEmbed`, so a long queue can't exceed Discord's per-embed
+/// character limit. Sent non-ephemerally (`ephemeral: false`), unlike the
+/// personal `/playlist_show`-style listings that share this pagination
+/// helper, since the queue is shared state everyone in the channel should
+/// be able to see.
 #[poise::command(slash_command, guild_only)]
 pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().expect("guild_only");
@@ -658,8 +682,7 @@ pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
         return Ok(());
     }
 
-    let mut current_line = String::new();
-    let mut upcoming = String::new();
+    let mut lines = Vec::with_capacity(handles.len());
     let mut total_duration = Duration::ZERO;
 
     for (i, handle) in handles.iter().enumerate() {
@@ -668,17 +691,16 @@ pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
             total_duration += d;
         }
         if i == 0 {
-            current_line = format!(
+            lines.push(format!(
                 "**Now Playing:**\n[{}]({})\n\n**Up Next:**",
                 meta.title, meta.url
-            );
+            ));
         } else {
-            upcoming.push_str(&format!("\n`{i}.` [{}]({})", meta.title, meta.url));
+            lines.push(format!("`{i}.` [{}]({})", meta.title, meta.url));
         }
     }
-
-    if upcoming.is_empty() {
-        upcoming.push_str("\n*Nothing queued up next.*");
+    if handles.len() == 1 {
+        lines.push("*Nothing queued up next.*".to_string());
     }
 
     let total_secs = total_duration.as_secs();
@@ -689,16 +711,18 @@ pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
         total_secs % 60
     );
 
-    let embed = serenity::CreateEmbed::new()
-        .title("🎵 Music Queue")
-        .description(format!("{current_line}{upcoming}"))
-        .color(serenity::Colour::BLUE)
-        .footer(serenity::CreateEmbedFooter::new(format!(
+    crate::pagination::send_paginated(
+        &ctx,
+        "🎵 Music Queue".to_string(),
+        serenity::Colour::BLUE,
+        lines,
+        format!(
             "{} song(s) in queue  •  Total duration: {total_str}",
             handles.len()
-        )));
-
-    ctx.send(poise::CreateReply::default().embed(embed)).await?;
+        ),
+        false,
+    )
+    .await?;
     Ok(())
 }
 
