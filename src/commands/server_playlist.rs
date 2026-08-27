@@ -3,13 +3,12 @@
 use poise::serenity_prelude as serenity;
 use serenity::Mentionable;
 
-use crate::commands::playback::{enqueue_known, ensure_call};
+use crate::commands::playback::{enqueue_multiple_known, ensure_call};
 use crate::models::Playlist;
 use crate::pagination;
 use crate::playlist::{self, Scope};
+use crate::ytdlp::TrackStream;
 use crate::{Context, Error};
-
-const MAX_BULK_ADD: usize = 150;
 
 /// Whether the invoking member has the `Administrator` permission. Backs
 /// `serverplaylist_create`, which is restricted to server admins.
@@ -125,22 +124,25 @@ pub async fn serverplaylist_show(
                     .await?;
                 return Ok(());
             }
-            let mut desc = String::new();
+            let mut lines = Vec::with_capacity(playlists.len());
             for p in &playlists {
                 let count = playlist::tracks(&ctx.data().db, p.id).await?.len();
                 let lock_icon = if p.locked { " 🔐" } else { "" };
-                desc.push_str(&format!(
-                    "📁 **{}**{lock_icon}\n> Owner: <@{}>, Tracks: {count}\n",
+                lines.push(format!(
+                    "📁 **{}**{lock_icon}\n> Owner: <@{}>, Tracks: {count}",
                     p.name, p.owner_id
                 ));
             }
             let guild_name = ctx.guild().map(|g| g.name.clone()).unwrap_or_default();
-            let embed = serenity::CreateEmbed::new()
-                .title(format!("Shared Playlists in '{guild_name}'"))
-                .description(desc)
-                .color(serenity::Colour::ORANGE);
-            ctx.send(poise::CreateReply::default().embed(embed).ephemeral(true))
-                .await?;
+            pagination::send_paginated(
+                &ctx,
+                format!("Shared Playlists in '{guild_name}'"),
+                serenity::Colour::ORANGE,
+                lines,
+                format!("Total {} playlists", playlists.len()),
+                true,
+            )
+            .await?;
         }
         Some(name) => {
             let Some(playlist) =
@@ -162,6 +164,7 @@ pub async fn serverplaylist_show(
                 serenity::Colour::ORANGE,
                 lines,
                 format!("Total {} tracks", tracks.len()),
+                true,
             )
             .await?;
         }
@@ -197,18 +200,7 @@ pub async fn serverplaylist_play(
 
     let call = ensure_call(&ctx).await?;
     let count = tracks.len();
-    for track in tracks {
-        enqueue_known(
-            &ctx,
-            &call,
-            &track.url,
-            &track.title,
-            track.duration,
-            ctx.author().id,
-            track.uploader.clone(),
-        )
-        .await?;
-    }
+    enqueue_multiple_known(&ctx, &call, &tracks, ctx.author().id).await?;
 
     ctx.say(format!(
         "✅ Queued {count} tracks from the server playlist '{name}'."
@@ -230,36 +222,39 @@ pub async fn serverplaylist_add(
         return Ok(());
     };
 
-    let tracks = match crate::ytdlp::resolve(&query).await {
-        Ok(t) => t,
+    let mut stream = match TrackStream::spawn(&query).await {
+        Ok(s) => s,
         Err(e) => {
             ctx.say(e.to_string()).await?;
             return Ok(());
         }
     };
 
-    if tracks.len() > MAX_BULK_ADD {
-        ctx.say(format!(
-            "❌ You can only add up to {MAX_BULK_ADD} tracks at once. (Detected: {})",
-            tracks.len()
-        ))
-        .await?;
+    let result =
+        playlist::import_tracks_from_stream(&ctx.data().db, playlist.id, &mut stream).await?;
+
+    if result.imported == 0 {
+        let message = match stream.finish().await {
+            Err(e) => e.to_string(),
+            Ok(()) => "❌ No addable tracks were found for that URL.".to_string(),
+        };
+        ctx.say(message).await?;
         return Ok(());
     }
 
-    let count = playlist::add_tracks(&ctx.data().db, playlist.id, &tracks).await?;
-    if count == 1 {
-        ctx.say(format!(
-            "✅ Added **{}** to playlist '{playlist_name}'.",
-            tracks[0].title
-        ))
-        .await?;
-    } else {
-        ctx.say(format!(
-            "✅ Added {count} tracks to playlist '{playlist_name}'."
-        ))
-        .await?;
+    let mut message = format!(
+        "✅ Added {} track{} to playlist '{playlist_name}'.",
+        result.imported,
+        if result.imported == 1 { "" } else { "s" }
+    );
+    if result.truncated {
+        message.push_str(&format!(
+            "\n⚠️ This source has more than {} tracks; only the first {} were added.",
+            playlist::MAX_BULK_ADD,
+            playlist::MAX_BULK_ADD
+        ));
     }
+    ctx.say(message).await?;
     Ok(())
 }
 
@@ -270,7 +265,11 @@ pub async fn serverplaylist_remove_track(
     #[description = "The name of the playlist."] playlist_name: String,
     #[description = "The number of the track to remove."] number: i64,
 ) -> Result<(), Error> {
-    let Some(playlist) = find_writable(&ctx, &playlist_name).await? else {
+    // Deleting a track is destructive and irreversible, unlike adding one --
+    // `find_permitted` requires owner/collaborator status regardless of the
+    // playlist's lock state, so an unlocked shared playlist can't have its
+    // tracks wiped by an arbitrary member.
+    let Some(playlist) = find_permitted(&ctx, &playlist_name).await? else {
         return Ok(());
     };
     match playlist::remove_track(&ctx.data().db, playlist.id, number).await? {
@@ -379,7 +378,7 @@ pub async fn serverplaylist_lock(
     let Some(playlist) = find_owned(&ctx, &name, false).await? else {
         return Ok(());
     };
-    let new_state = playlist::toggle_lock(&ctx.data().db, playlist.id, playlist.locked).await?;
+    let new_state = playlist::toggle_lock(&ctx.data().db, playlist.id).await?;
     let label = if new_state {
         "locked 🔐"
     } else {

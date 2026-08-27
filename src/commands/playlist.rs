@@ -2,12 +2,11 @@
 
 use poise::serenity_prelude as serenity;
 
-use crate::commands::playback::{enqueue_known, ensure_call};
+use crate::commands::playback::{enqueue_multiple_known, ensure_call};
 use crate::pagination;
 use crate::playlist::{self, Scope};
+use crate::ytdlp::TrackStream;
 use crate::{Context, Error};
-
-const MAX_BULK_ADD: usize = 150;
 
 /// Creates a new personal playlist.
 #[poise::command(slash_command, guild_only)]
@@ -44,36 +43,39 @@ pub async fn playlist_add(
         return Ok(());
     };
 
-    let tracks = match crate::ytdlp::resolve(&query).await {
-        Ok(t) => t,
+    let mut stream = match TrackStream::spawn(&query).await {
+        Ok(s) => s,
         Err(e) => {
             ctx.say(e.to_string()).await?;
             return Ok(());
         }
     };
 
-    if tracks.len() > MAX_BULK_ADD {
-        ctx.say(format!(
-            "❌ You can only add up to {MAX_BULK_ADD} tracks at once. (Detected: {})",
-            tracks.len()
-        ))
-        .await?;
+    let result =
+        playlist::import_tracks_from_stream(&ctx.data().db, playlist.id, &mut stream).await?;
+
+    if result.imported == 0 {
+        let message = match stream.finish().await {
+            Err(e) => e.to_string(),
+            Ok(()) => "❌ No addable tracks were found for that URL.".to_string(),
+        };
+        ctx.say(message).await?;
         return Ok(());
     }
 
-    let count = playlist::add_tracks(&ctx.data().db, playlist.id, &tracks).await?;
-    if count == 1 {
-        ctx.say(format!(
-            "✅ Added **{}** to playlist '{playlist_name}'.",
-            tracks[0].title
-        ))
-        .await?;
-    } else {
-        ctx.say(format!(
-            "✅ Added {count} tracks to playlist '{playlist_name}'."
-        ))
-        .await?;
+    let mut message = format!(
+        "✅ Added {} track{} to playlist '{playlist_name}'.",
+        result.imported,
+        if result.imported == 1 { "" } else { "s" }
+    );
+    if result.truncated {
+        message.push_str(&format!(
+            "\n⚠️ This source has more than {} tracks; only the first {} were added.",
+            playlist::MAX_BULK_ADD,
+            playlist::MAX_BULK_ADD
+        ));
     }
+    ctx.say(message).await?;
     Ok(())
 }
 
@@ -100,18 +102,7 @@ pub async fn playlist_play(
 
     let call = ensure_call(&ctx).await?;
     let count = tracks.len();
-    for track in tracks {
-        enqueue_known(
-            &ctx,
-            &call,
-            &track.url,
-            &track.title,
-            track.duration,
-            ctx.author().id,
-            track.uploader.clone(),
-        )
-        .await?;
-    }
+    enqueue_multiple_known(&ctx, &call, &tracks, ctx.author().id).await?;
 
     ctx.say(format!("🔄 Queued {count} tracks from playlist '{name}'."))
         .await?;
@@ -133,17 +124,20 @@ pub async fn playlist_show(
                 ctx.say("You have no personal playlists.").await?;
                 return Ok(());
             }
-            let mut desc = String::new();
+            let mut lines = Vec::with_capacity(playlists.len());
             for p in &playlists {
                 let count = playlist::tracks(&ctx.data().db, p.id).await?.len();
-                desc.push_str(&format!("📁 **{}** ({count} tracks)\n", p.name));
+                lines.push(format!("📁 **{}** ({count} tracks)", p.name));
             }
-            let embed = serenity::CreateEmbed::new()
-                .title(format!("{}'s Playlists", ctx.author().display_name()))
-                .description(desc)
-                .color(serenity::Colour::PURPLE);
-            ctx.send(poise::CreateReply::default().embed(embed).ephemeral(true))
-                .await?;
+            pagination::send_paginated(
+                &ctx,
+                format!("{}'s Playlists", ctx.author().display_name()),
+                serenity::Colour::PURPLE,
+                lines,
+                format!("Total {} playlists", playlists.len()),
+                true,
+            )
+            .await?;
         }
         Some(name) => {
             let Some(playlist) =
@@ -164,6 +158,7 @@ pub async fn playlist_show(
                 serenity::Colour::PURPLE,
                 lines,
                 format!("Total {} tracks", tracks.len()),
+                true,
             )
             .await?;
         }
