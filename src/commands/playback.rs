@@ -92,8 +92,14 @@ pub(crate) async fn ensure_call_raw(
     let mut state = state_arc.lock().await;
     state.text_channel = Some(post_channel_id);
 
+    let mut call_lock = call.lock().await;
+    // This bot advertises itself as high-fidelity, so always push Opus at
+    // Discord's maximum bitrate rather than following the voice channel's
+    // (often much lower) recommended default. Idempotent -- safe to set on
+    // every join, not just the first one for this guild.
+    call_lock.set_bitrate(songbird::driver::Bitrate::Bits(128_000));
+
     if !state.panel_events_registered {
-        let mut call_lock = call.lock().await;
         let updater = PanelUpdater {
             http: http.clone(),
             guild_id,
@@ -136,6 +142,7 @@ pub(crate) async fn ensure_call_raw(
         );
         state.panel_events_registered = true;
     }
+    drop(call_lock);
     drop(state);
 
     // Starts the idle-leave countdown for a bare `/join` with nothing queued.
@@ -765,6 +772,10 @@ pub async fn nowplaying(ctx: Context<'_>) -> Result<(), Error> {
                 .await;
         }
         state.now_playing_message = None;
+        // Re-remember the channel `/nowplaying` was just run in, so the
+        // panel actually moves there instead of reappearing in whichever
+        // channel it was originally posted to.
+        state.text_channel = Some(ctx.channel_id());
     }
 
     crate::player::refresh_panel(

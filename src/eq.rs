@@ -156,50 +156,72 @@ pub fn balanced_profile() -> EqProfile {
 
 /// Hi-Fi mode's built-in default, overridable at startup via
 /// `EQ_HIFI_FILTER` (an arbitrary raw `-af` string, bypassing this profile
-/// entirely). Bass/mid/treble bands, sub-bass reinforcement, stereo
-/// widening, a touch of echo, and a punchier compand/loudnorm curve than
-/// Balanced. The treble band and its gain are this round's audible tuning
-/// pass -- the previous default had no presence/air band at all.
+/// entirely).
+///
+/// A 6-band subtractive parametric EQ: rather than boosting everything
+/// (the previous 3-band Bass/Mid/Treble default), this cuts the bands that
+/// cause muddiness (Mid-Bass) and listening fatigue (Upper-Mid) and only
+/// lifts the bands that add clarity/air, on the theory that "no coloration"
+/// reads as cleaner over a lossy Opus link than "boosted everywhere."
+/// `sub_boost`/`stereo_width`/`echo` are all dropped -- these spatial
+/// effects added CPU cost and clipping risk without a clearly audible
+/// benefit once re-encoded through Discord's Opus pipeline. `compand` and
+/// `loudnorm` are aligned with Balanced's headroom-conscious targets
+/// (same `-18 LUFS`/attack curve), with a slightly wider loudness range
+/// and less peak limiting than Balanced to preserve more dynamics.
 pub fn default_hifi_profile() -> EqProfile {
     EqProfile {
         resample_precision: 33,
         bands: vec![
+            // Sub-Bass: foundation.
             EqBand {
-                freq_hz: 55.0,
-                width_hz: 15.0,
-                gain_db: 2.0,
-            },
-            EqBand {
-                freq_hz: 1_000.0,
-                width_hz: 200.0,
+                freq_hz: 60.0,
+                width_hz: 40.0,
                 gain_db: 1.5,
             },
+            // Mid-Bass: cut to remove muddiness.
             EqBand {
-                freq_hz: 9_000.0,
+                freq_hz: 250.0,
+                width_hz: 150.0,
+                gain_db: -1.0,
+            },
+            // Mid: reference point, left flat.
+            EqBand {
+                freq_hz: 1_000.0,
+                width_hz: 500.0,
+                gain_db: 0.0,
+            },
+            // Upper-Mid: cut to reduce listening fatigue.
+            EqBand {
+                freq_hz: 3_000.0,
+                width_hz: 1_000.0,
+                gain_db: -0.5,
+            },
+            // Presence: clarity.
+            EqBand {
+                freq_hz: 8_000.0,
                 width_hz: 2_000.0,
-                gain_db: 1.2,
+                gain_db: 1.5,
+            },
+            // Air: sense of openness.
+            EqBand {
+                freq_hz: 14_000.0,
+                width_hz: 3_000.0,
+                gain_db: 1.0,
             },
         ],
-        sub_boost: Some(SubBoost {
-            cutoff_hz: 70.0,
-            feedback: 0.2,
-        }),
-        stereo_width: Some(StereoWidth { m: 1.1 }),
-        echo: Some(Echo {
-            in_gain: 0.8,
-            out_gain: 0.3,
-            delay_ms: 20.0,
-            decay: 0.02,
-        }),
+        sub_boost: None,
+        stereo_width: None,
+        echo: None,
         compand: Compand {
-            attack_s: 0.005,
+            attack_s: 0.02,
             decay_s: 0.1,
-            points: vec![(-80.0, -80.0), (-30.0, -20.0), (-10.0, -8.0), (0.0, -5.0)],
+            points: vec![(-80.0, -80.0), (-35.0, -35.0), (0.0, -5.0)],
         },
         loudnorm: Loudnorm {
-            integrated_lufs: -14.0,
+            integrated_lufs: -18.0,
             range_lu: 11.0,
-            true_peak_dbtp: -1.0,
+            true_peak_dbtp: -1.5,
         },
     }
 }
@@ -220,8 +242,16 @@ loudnorm=I=-18:LRA=10:TP=-2"
     }
 
     #[test]
-    fn hifi_default_includes_a_treble_band() {
+    fn hifi_default_is_a_six_band_subtractive_eq_without_spatial_effects() {
         let filter = default_hifi_profile().render();
-        assert!(filter.contains("f=9000 w=2000 g=1.2"));
+        assert!(filter.contains("f=60 w=40 g=1.5"), "sub-bass foundation");
+        assert!(filter.contains("f=250 w=150 g=-1"), "mid-bass cut");
+        assert!(filter.contains("f=1000 w=500 g=0"), "flat mid reference");
+        assert!(filter.contains("f=3000 w=1000 g=-0.5"), "upper-mid cut");
+        assert!(filter.contains("f=8000 w=2000 g=1.5"), "presence lift");
+        assert!(filter.contains("f=14000 w=3000 g=1"), "air lift");
+        assert!(!filter.contains("asubboost"));
+        assert!(!filter.contains("extrastereo"));
+        assert!(!filter.contains("aecho"));
     }
 }

@@ -155,7 +155,6 @@ async fn spawn_pipeline(
 ) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
     let stream_url = resolve_stream_url(url, extra_args).await?;
 
-    let is_hifi = eq_filter.is_some();
     let filter: Cow<str> = match eq_filter {
         Some(f) => Cow::Borrowed(f),
         None => Cow::Owned(crate::eq::balanced_profile().render()),
@@ -163,32 +162,31 @@ async fn spawn_pipeline(
 
     let mut ffmpeg = std::process::Command::new("ffmpeg");
     ffmpeg.args(["-hide_banner", "-loglevel", "error"]);
-    ffmpeg.args(["-reconnect", "1", "-reconnect_streamed", "1"]);
-    if is_hifi {
-        ffmpeg.args([
-            "-reconnect_delay_max",
-            "10",
-            "-rw_timeout",
-            "15000000",
-            "-thread_queue_size",
-            "16384",
-            "-analyzeduration",
-            "10M",
-            "-probesize",
-            "10M",
-            "-fflags",
-            "+nobuffer+genpts",
-        ]);
-    } else {
-        ffmpeg.args([
-            "-reconnect_delay_max",
-            "5",
-            "-rw_timeout",
-            "5000000",
-            "-thread_queue_size",
-            "4096",
-        ]);
-    }
+    // One transport/probing profile for both EQ modes -- the previous
+    // Hi-Fi-only settings (10-16M analyze/probe, 15s rw_timeout) were
+    // tuned for robustness but delayed playback start; this profile still
+    // reconnects on TCP/TLS drops and 4xx/5xx HTTP errors, just without
+    // over-provisioning the startup probe.
+    ffmpeg.args([
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_on_network_error",
+        "1",
+        "-reconnect_on_http_error",
+        "4xx,5xx",
+        "-reconnect_delay_max",
+        "5",
+        "-rw_timeout",
+        "10000000",
+        "-thread_queue_size",
+        "4096",
+        "-analyzeduration",
+        "5M",
+        "-probesize",
+        "5M",
+    ]);
     // Input (demuxer-level) seek, placed before `-i`.
     let seek_arg = seek_time.map(|d| format!("{:.3}", d.as_secs_f64()));
     if let Some(seek_arg) = &seek_arg {
