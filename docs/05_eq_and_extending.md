@@ -38,16 +38,25 @@ Places where bands or effects are `Option`/`Vec` indicate the intention "not use
 | Parameter | Balanced | Hi-Fi |
 |---|---|---|
 | Resample Precision | 24 | 33 |
-| Band (Bass) | 60Hz / w15 / +1.5dB | 55Hz / w15 / +2.0dB |
-| Band (Mid) | — | 1000Hz / w200 / +1.5dB |
-| Band (Treble) | — | 9000Hz / w2000 / +1.2dB |
-| Sub-bass Boost | — | cutoff 70Hz / feedback 0.2 |
-| Stereo Width | — | m=1.1 |
-| Echo | — | in 0.8 / out 0.3 / 20ms / decay 0.02 |
-| Compressor | Gentle (attack 0.02s) | Slightly strong (attack 0.005s) |
-| Loudness Target | I=-18 LUFS / TP=-2.0dB | I=-14 LUFS / TP=-1.0dB |
+| Band 1: Sub-Bass (Foundation) | 60Hz / w15 / +1.5dB | 60Hz / w40 / +1.5dB |
+| Band 2: Mid-Bass (Mud Cut) | — | 250Hz / w150 / -1.0dB |
+| Band 3: Mid (Anchor) | — | 1000Hz / w500 / 0dB |
+| Band 4: Upper-Mid (Harshness Cut) | — | 3000Hz / w1000 / -0.5dB |
+| Band 5: Presence (Clarity) | — | 8000Hz / w2000 / +1.5dB |
+| Band 6: Air (Sparkle) | — | 14000Hz / w3000 / +1.0dB |
+| Sub-bass Boost (`asubboost`) | — | Removed |
+| Stereo Width (`extrastereo`) | — | Removed |
+| Echo (`aecho`) | — | Removed |
+| Compressor | Gentle (attack 0.02s) | Unified with Balanced (attack 0.02s) |
+| Loudness Target | I=-18 LUFS / LRA=10 / TP=-2.0dB | I=-18 LUFS / LRA=11 / TP=-1.5dB |
 
-The Treble band is a newly added parameter in this refactoring. The previous Hi-Fi filter had low (Bass) and mid (Mid) corrections but no high-frequency correction at all. It was added to fill the missing piece when viewed as a three-band "Bass/Mid/Treble" configuration, reinforcing the clarity and presence of the Hi-Fi mode.
+### Why we shifted from "Additive EQ" to "Subtractive EQ"
+
+The previous Hi-Fi profile was configured to **boost all three bands** (Bass/Mid/Treble), layered with spatial effects like `asubboost`, `extrastereo`, and `aecho`. While the idea of "adding missing frequencies" is intuitive, boosting multiple bands simultaneously stacks dB levels, increasing the risk of clipping. Furthermore, spatial effects increase CPU load, yet their impact is hard to discern once passed through Discord's Opus re-encoding.
+
+The new 6-band configuration, conversely, is primarily based on **subtraction**. Cutting the 250Hz band (Mid-Bass) by -1.0dB removes the "muddiness" caused by the overlapping overtones of the kick/bass and the low-end of vocals. Cutting the 3000Hz band (Upper-Mid) by -0.5dB prevents listening fatigue; this is the frequency range human hearing is most sensitive to, and boosting it creates perceived loudness but easily results in a "harsh" or "digital" sound over long listening sessions. We only boost three bands: Sub-Bass (foundation), Presence (clarity), and Air (sparkle), shifting to a subtractive-first design: "cut what needs to be cut, and only add what is necessary."
+
+By standardizing `loudnorm` to `I=-18 LUFS` (the same as Balanced), both modes secure enough headroom (margin before clipping) without pushing the loudness too high. The Hi-Fi mode is tuned to retain more dynamics (dynamic range) than Balanced by setting `LRA` (Loudness Range) slightly wider and `TP` (True Peak limit) slightly looser.
 
 ## `EQ_HIFI_FILTER` Environment Variable: A raw string loophole bypassing structs
 
