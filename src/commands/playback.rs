@@ -71,6 +71,39 @@ fn user_voice_channel(ctx: &Context<'_>) -> Result<serenity::ChannelId, Error> {
         .ok_or_else(|| "You must be in a voice channel first.".into())
 }
 
+/// Resolves `voice_channel_id`'s own configured bitrate cap (the value
+/// shown in Discord's channel settings) -- preferring the cache, falling
+/// back to a fresh HTTP fetch on a cache miss, and finally to songbird's
+/// own default if that comes up empty too. Used so the Opus encoder never
+/// exceeds what this specific channel (and thus Discord's SFU) actually
+/// allows: unconditionally requesting `Bitrate::Max` ignored the channel's
+/// negotiated cap and could make the server drop packets -- audible as
+/// stutter -- on high-entropy material.
+async fn resolve_target_bitrate(
+    cache: &serenity::Cache,
+    http: &serenity::Http,
+    guild_id: serenity::GuildId,
+    voice_channel_id: serenity::ChannelId,
+) -> songbird::driver::Bitrate {
+    let cached_bitrate = cache.guild(guild_id).and_then(|guild| {
+        guild
+            .channels
+            .get(&voice_channel_id)
+            .and_then(|c| c.bitrate)
+    });
+
+    let bps = match cached_bitrate {
+        Some(bps) => Some(bps),
+        None => match voice_channel_id.to_channel(http).await {
+            Ok(serenity::Channel::Guild(guild_channel)) => guild_channel.bitrate,
+            _ => None,
+        },
+    };
+
+    bps.map(|bps| songbird::driver::Bitrate::Bits(bps as i32))
+        .unwrap_or(songbird::constants::DEFAULT_BITRATE)
+}
+
 /// Raw-parameter version of `ensure_call`, for call sites without a poise
 /// `Context`. Joins (or moves to) `voice_channel_id`, records
 /// `post_channel_id` for the Now Playing panel, and registers the panel's
@@ -78,6 +111,7 @@ fn user_voice_channel(ctx: &Context<'_>) -> Result<serenity::ChannelId, Error> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn ensure_call_raw(
     http: Arc<serenity::Http>,
+    cache: Arc<serenity::Cache>,
     extra_args: Vec<String>,
     guild_players: Arc<crate::player::GuildPlayers>,
     manager: Arc<Songbird>,
@@ -92,12 +126,12 @@ pub(crate) async fn ensure_call_raw(
     let mut state = state_arc.lock().await;
     state.text_channel = Some(post_channel_id);
 
+    // Resolved before taking the call lock, since it may need a network
+    // round-trip on a cache miss.
+    let target_bitrate = resolve_target_bitrate(&cache, &http, guild_id, voice_channel_id).await;
+
     let mut call_lock = call.lock().await;
-    // This bot advertises itself as high-fidelity, so always push Opus at
-    // Discord's maximum bitrate rather than following the voice channel's
-    // (often much lower) recommended default. Idempotent -- safe to set on
-    // every join, not just the first one for this guild.
-    call_lock.set_bitrate(songbird::driver::Bitrate::Bits(128_000));
+    call_lock.set_bitrate(target_bitrate);
 
     if !state.panel_events_registered {
         let updater = PanelUpdater {
@@ -160,6 +194,7 @@ pub(crate) async fn ensure_call(ctx: &Context<'_>) -> Result<Arc<TokioMutex<Call
     let manager = songbird_manager(ctx).await?;
     ensure_call_raw(
         ctx.serenity_context().http.clone(),
+        ctx.serenity_context().cache.clone(),
         ctx.data().ytdlp_extra_args.clone(),
         ctx.data().guild_players.clone(),
         manager,
