@@ -281,6 +281,7 @@ async fn handle_select(
     };
     let call = ensure_call_raw(
         ctx.http.clone(),
+        ctx.cache.clone(),
         data.ytdlp_extra_args.clone(),
         data.guild_players.clone(),
         manager,
