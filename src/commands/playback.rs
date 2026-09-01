@@ -241,6 +241,7 @@ pub(crate) async fn enqueue_known_raw(
         requester_name,
         start_offset: Duration::ZERO,
         is_seek: false,
+        is_loop_clone: false,
     });
     let track = Track::new_with_data(source.into(), meta).volume(volume);
     call.lock().await.enqueue(track).await;
@@ -284,6 +285,7 @@ pub(crate) async fn enqueue_multiple_known(
             requester_name: requester_name.clone(),
             start_offset: Duration::ZERO,
             is_seek: false,
+            is_loop_clone: false,
         });
         let built = Track::new_with_data(source.into(), meta).volume(volume);
         call.enqueue(built).await;
@@ -370,6 +372,7 @@ async fn resolve_and_build_track(ctx: &Context<'_>, url: &str) -> Result<(Track,
         requester_name: ctx.author().display_name().to_string(),
         start_offset: Duration::ZERO,
         is_seek: false,
+        is_loop_clone: false,
     });
     let track = Track::new_with_data(source.into(), meta).volume(volume);
     Ok((track, title))
@@ -377,6 +380,10 @@ async fn resolve_and_build_track(ctx: &Context<'_>, url: &str) -> Result<(Track,
 
 /// Enqueues `track`, then moves it to index 1 (right after the current
 /// track) if it didn't land at the front already. Backs `/playnext`.
+///
+/// If index 1 is currently `LoopMode::Track`'s pre-emptive clone (see
+/// `crate::player::ensure_track_loop_clone`), lands at index 2 instead,
+/// leaving the clone in place rather than displacing it.
 async fn enqueue_next(call: &Arc<TokioMutex<Call>>, track: Track) {
     let mut call = call.lock().await;
     call.enqueue(track).await;
@@ -384,7 +391,15 @@ async fn enqueue_next(call: &Arc<TokioMutex<Call>>, track: Track) {
         if tracks.len() > 1
             && let Some(just_added) = tracks.pop_back()
         {
-            tracks.insert(1, just_added);
+            let insert_at = if tracks
+                .get(1)
+                .is_some_and(|t| t.data::<TrackMeta>().is_loop_clone)
+            {
+                2
+            } else {
+                1
+            };
+            tracks.insert(insert_at.min(tracks.len()), just_added);
         }
     });
 }
@@ -466,9 +481,21 @@ pub async fn shuffle(ctx: Context<'_>) -> Result<(), Error> {
         use rand::seq::SliceRandom;
         let call = call.lock().await;
         call.queue().modify_queue(|tracks| {
-            let tail_len = tracks.len().saturating_sub(1);
+            // Index 1 is reserved for `LoopMode::Track`'s pre-emptive clone
+            // (see `crate::player::ensure_track_loop_clone`) when one is
+            // present; leave it in place and only shuffle what's
+            // genuinely upcoming.
+            let start_idx = if tracks
+                .get(1)
+                .is_some_and(|t| t.data::<TrackMeta>().is_loop_clone)
+            {
+                2
+            } else {
+                1
+            };
+            let tail_len = tracks.len().saturating_sub(start_idx);
             if tail_len > 1 {
-                tracks.make_contiguous()[1..].shuffle(&mut rand::thread_rng());
+                tracks.make_contiguous()[start_idx..].shuffle(&mut rand::thread_rng());
             }
             tail_len
         })
@@ -616,6 +643,10 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
         return Ok(());
     };
 
+    // Discard any pending loop-clone first, so skip advances to the real
+    // next track instead of just replaying the current one again.
+    crate::player::remove_track_loop_clone(&call).await;
+
     let skipped_title = {
         let call = call.lock().await;
         let queue = call.queue();
@@ -681,11 +712,21 @@ pub async fn loop_cmd(
         state.loop_mode = mode;
     }
 
-    // No native songbird call needed -- `LoopHandler` reads
-    // `GuildPlayerState::loop_mode` (already updated above) directly
-    // whenever a track ends.
+    // No native songbird call needed for the mode switch itself --
+    // `LoopHandler` reads `GuildPlayerState::loop_mode` (already updated
+    // above) directly whenever a track ends. The pre-emptive clone
+    // invariant does need updating here, though: seed one immediately when
+    // switching *to* Track (there's no `TrackEvent::End` to trigger
+    // `LoopHandler` until the current track actually finishes), and drop
+    // any pending one when switching away, so it doesn't keep silently
+    // replaying forever.
     let manager = songbird_manager(&ctx).await?;
     if let Some(call) = manager.get(guild_id) {
+        if mode == crate::player::LoopMode::Track {
+            crate::player::ensure_track_loop_clone(&call, &ctx.data().ytdlp_extra_args).await;
+        } else {
+            crate::player::remove_track_loop_clone(&call).await;
+        }
         crate::player::refresh_panel(
             &ctx.serenity_context().http,
             guild_id,
@@ -733,10 +774,20 @@ pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
             total_duration += d;
         }
         if i == 0 {
-            lines.push(format!(
-                "**Now Playing:**\n[{}]({})\n\n**Up Next:**",
-                meta.title, meta.url
-            ));
+            let now_playing = if meta.is_loop_clone {
+                format!(
+                    "**Now Playing:**\n🔁 [{}]({}) *(Loop)*\n\n**Up Next:**",
+                    meta.title, meta.url
+                )
+            } else {
+                format!(
+                    "**Now Playing:**\n[{}]({})\n\n**Up Next:**",
+                    meta.title, meta.url
+                )
+            };
+            lines.push(now_playing);
+        } else if meta.is_loop_clone {
+            lines.push(format!("`{i}.` 🔁 [{}]({}) *(Loop)*", meta.title, meta.url));
         } else {
             lines.push(format!("`{i}.` [{}]({})", meta.title, meta.url));
         }

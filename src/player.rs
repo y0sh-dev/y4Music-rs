@@ -35,6 +35,13 @@ pub struct TrackMeta {
     /// Whether this is a `seek_to` replacement track rather than a genuinely
     /// new one. `LoopHandler` uses this to avoid re-enqueueing a duplicate.
     pub is_seek: bool,
+    /// Whether this track is `LoopMode::Track`'s pre-emptive duplicate of
+    /// the track ahead of it in the queue (see `ensure_track_loop_clone`),
+    /// rather than a genuinely distinct queue entry. Keeps queue index 1
+    /// reserved/identifiable for `remove_track_loop_clone` and the
+    /// `/shuffle`/`/playnext` offset checks, and drives the "(Loop)"
+    /// annotation in `/queue`.
+    pub is_loop_clone: bool,
 }
 
 /// Best-effort thumbnail URL derived from a YouTube video ID. Returns `None`
@@ -93,7 +100,7 @@ fn progress_bar(position: Duration, total: Duration) -> String {
 
 /// How often the Now Playing panel is re-rendered while a track plays, so
 /// its progress bar visibly advances.
-const PROGRESS_TICK_INTERVAL: Duration = Duration::from_secs(10);
+const PROGRESS_TICK_INTERVAL: Duration = Duration::from_secs(15);
 
 /// How long the bot waits, after everyone leaves its voice channel, before
 /// auto-leaving.
@@ -437,14 +444,107 @@ impl SongbirdEventHandler for PlaybackErrorNotifier {
     }
 }
 
+/// Ensures the currently playing track has a pre-emptive duplicate
+/// (`is_loop_clone: true`) queued immediately after it, at index 1.
+/// Idempotent: a no-op if index 1 already holds a loop-clone, or if
+/// nothing is currently playing.
+///
+/// This is the core of `LoopMode::Track`'s "pre-emptive duplication"
+/// design (see `LoopHandler`'s doc comment for why the old post-hoc
+/// stop-and-splice approach was replaced). By keeping the *next* repeat of
+/// the current track already sitting in the queue ahead of time, an
+/// ordinary `TrackEvent::End` needs no special-casing at all: songbird's
+/// own forward-only queue advancement naturally plays the clone next, and
+/// this function is simply called again afterward to top up the following
+/// lap's clone.
+pub(crate) async fn ensure_track_loop_clone(call: &Arc<Mutex<Call>>, extra_args: &[String]) {
+    let mut call = call.lock().await;
+
+    let Some(current) = call.queue().current() else {
+        return;
+    };
+    let already_topped_up = call
+        .queue()
+        .current_queue()
+        .get(1)
+        .is_some_and(|handle| handle.data::<TrackMeta>().is_loop_clone);
+    if already_topped_up {
+        return;
+    }
+
+    let meta = current.data::<TrackMeta>();
+    let volume = current.get_info().await.map(|s| s.volume).unwrap_or(1.0);
+
+    let source = FfmpegEqSource {
+        url: meta.url.clone(),
+        ytdlp_extra_args: extra_args.to_vec(),
+        eq_filter: meta.eq_filter.clone(),
+        seek_time: None,
+    };
+    let clone_meta = Arc::new(TrackMeta {
+        title: meta.title.clone(),
+        url: meta.url.clone(),
+        requested_by: meta.requested_by,
+        duration: meta.duration,
+        eq_filter: meta.eq_filter.clone(),
+        thumbnail: meta.thumbnail.clone(),
+        uploader: meta.uploader.clone(),
+        requester_name: meta.requester_name.clone(),
+        start_offset: Duration::ZERO,
+        is_seek: false,
+        is_loop_clone: true,
+    });
+    let clone_track = Track::new_with_data(source.into(), clone_meta).volume(volume);
+    let clone_handle = call.enqueue(clone_track).await;
+
+    call.queue().modify_queue(|tracks| {
+        if let Some(pos) = tracks.iter().position(|q| q.uuid() == clone_handle.uuid())
+            && let Some(clone) = tracks.remove(pos)
+        {
+            let insert_at = 1.min(tracks.len());
+            tracks.insert(insert_at, clone);
+        }
+    });
+}
+
+/// Removes and stops the loop-clone at index 1, if present. A no-op
+/// otherwise. Used whenever the *real* next track needs to be back at
+/// index 1 -- turning `LoopMode::Track` off, or skipping past the clone so
+/// `/skip`/the SKIP button advance to a genuinely different track instead
+/// of just replaying the current one again.
+pub(crate) async fn remove_track_loop_clone(call: &Arc<Mutex<Call>>) {
+    let call = call.lock().await;
+    call.queue().modify_queue(|tracks| {
+        if tracks
+            .get(1)
+            .is_some_and(|t| t.data::<TrackMeta>().is_loop_clone)
+            && let Some(removed) = tracks.remove(1)
+        {
+            let _ = removed.stop();
+        }
+    });
+}
+
 /// Songbird global event handler, registered for `TrackEvent::End`, that
 /// implements both `LoopMode::Queue` and `LoopMode::Track` by re-enqueueing
 /// a fresh copy of the ended track (a songbird `Track` can't be replayed
 /// once finished, and -- see below -- `FfmpegEqSource`'s raw PCM stream
 /// can't be native-seeked back to the start either). `Queue` appends the
-/// copy to the back; `Track` swaps it back into the front so the same song
-/// repeats before the next queued one plays. Skips a track that ended in
-/// `PlayMode::Errored`, so a permanently-broken URL doesn't loop forever.
+/// copy to the back.
+///
+/// `Track` used to swap a fresh copy back into the front and stop whatever
+/// songbird had already auto-advanced to, right here in the `End` handler.
+/// That post-hoc splice raced with songbird's own forward-only queue
+/// advancement -- which had *already* happened by the time this handler
+/// runs -- and could drop whatever else was queued behind it. It's been
+/// replaced by pre-emptive duplication (`ensure_track_loop_clone`): a
+/// clone of the current track is kept queued one slot ahead at all times,
+/// so by the time a track actually ends, the "repeat" is already next in
+/// line and songbird's ordinary advancement handles it with no splicing
+/// needed here at all -- this handler's only remaining job for `Track` is
+/// to top up the clone for the *following* lap. Skips a track that ended
+/// in `PlayMode::Errored`, so a permanently-broken URL doesn't loop
+/// forever.
 ///
 /// `LoopMode::Track` deliberately does *not* use songbird's native
 /// `TrackHandle::enable_loop()`. That mechanism restarts a track by seeking
@@ -502,54 +602,38 @@ impl SongbirdEventHandler for LoopHandler {
                 continue;
             }
 
-            let source = FfmpegEqSource {
-                url: meta.url.clone(),
-                ytdlp_extra_args: self.extra_args.clone(),
-                eq_filter: meta.eq_filter.clone(),
-                seek_time: None,
-            };
-            let new_meta = Arc::new(TrackMeta {
-                title: meta.title.clone(),
-                url: meta.url.clone(),
-                requested_by: meta.requested_by,
-                duration: meta.duration,
-                eq_filter: meta.eq_filter.clone(),
-                thumbnail: meta.thumbnail.clone(),
-                uploader: meta.uploader.clone(),
-                requester_name: meta.requester_name.clone(),
-                start_offset: Duration::ZERO,
-                is_seek: false,
-            });
-            let new_track = Track::new_with_data(source.into(), new_meta).volume(state.volume);
-
             match loop_mode {
                 LoopMode::Queue => {
+                    let source = FfmpegEqSource {
+                        url: meta.url.clone(),
+                        ytdlp_extra_args: self.extra_args.clone(),
+                        eq_filter: meta.eq_filter.clone(),
+                        seek_time: None,
+                    };
+                    let new_meta = Arc::new(TrackMeta {
+                        title: meta.title.clone(),
+                        url: meta.url.clone(),
+                        requested_by: meta.requested_by,
+                        duration: meta.duration,
+                        eq_filter: meta.eq_filter.clone(),
+                        thumbnail: meta.thumbnail.clone(),
+                        uploader: meta.uploader.clone(),
+                        requester_name: meta.requester_name.clone(),
+                        start_offset: Duration::ZERO,
+                        is_seek: false,
+                        is_loop_clone: false,
+                    });
+                    let new_track =
+                        Track::new_with_data(source.into(), new_meta).volume(state.volume);
                     self.call.lock().await.enqueue(new_track).await;
                 }
                 LoopMode::Track => {
-                    // By the time this handler runs, songbird's own internal
-                    // queue advancement has already popped the ended track
-                    // and started whatever was next (if anything). Swap our
-                    // fresh copy back into the front and stop that
-                    // already-started track, so the same song repeats
-                    // before the queue moves on.
-                    let mut call = self.call.lock().await;
-                    let new_handle = call.enqueue(new_track).await;
-                    let displaced = call.queue().modify_queue(|tracks| {
-                        let pos = tracks.iter().position(|q| q.uuid() == new_handle.uuid());
-                        let new_queued = pos.and_then(|i| tracks.remove(i));
-                        let displaced = tracks.pop_front();
-                        if let Some(new_queued) = new_queued {
-                            tracks.push_front(new_queued);
-                        }
-                        displaced
-                    });
-                    if let Some(displaced) = displaced
-                        && displaced.uuid() != new_handle.uuid()
-                    {
-                        let _ = displaced.stop();
-                        let _ = new_handle.play();
-                    }
+                    // The clone `ensure_track_loop_clone` had already queued
+                    // at index 1 is, by now, whatever songbird's ordinary
+                    // forward-only advancement moved on to when this track
+                    // ended -- no manual stop/splice needed. Just top up the
+                    // *following* lap's clone so the invariant holds again.
+                    ensure_track_loop_clone(&self.call, &self.extra_args).await;
                 }
                 LoopMode::Off => unreachable!("filtered out above"),
             }
@@ -979,6 +1063,7 @@ pub async fn seek_to(
         requester_name: meta.requester_name.clone(),
         start_offset: target,
         is_seek: true,
+        is_loop_clone: meta.is_loop_clone,
     });
     let new_track = Track::new_with_data(source.into(), new_meta).volume(volume);
     let new_handle = call.enqueue(new_track).await;
@@ -1194,6 +1279,19 @@ pub async fn handle_component_interaction(
         None
     };
 
+    // Keep the `LoopMode::Track` pre-emptive clone invariant in sync with
+    // the mode change above: seed one immediately on switching *to* Track
+    // (there's no `TrackEvent::End` to trigger `LoopHandler` until the
+    // current track actually finishes), and drop any pending one when
+    // switching away, so it doesn't keep silently replaying forever.
+    if let Some(mode) = new_loop_mode {
+        if mode == LoopMode::Track {
+            ensure_track_loop_clone(&call, ytdlp_extra_args).await;
+        } else {
+            remove_track_loop_clone(&call).await;
+        }
+    }
+
     // Seek buttons lock `call` themselves via `seek_by`, so they're handled
     // outside the `call_lock` block below.
     let ephemeral_note = if matches!(custom_id, custom_id::SEEK_BACK | custom_id::SEEK_FORWARD) {
@@ -1203,6 +1301,19 @@ pub async fn handle_component_interaction(
             PANEL_SEEK_STEP_SECS
         };
         seek_by(&call, ytdlp_extra_args, delta_secs).await.err()
+    } else if custom_id == custom_id::SKIP {
+        // Discard any pending loop-clone first (needs its own lock on
+        // `call`, taken and released before the `call_lock` block below),
+        // so skip advances to the real next track instead of just
+        // replaying the current one again.
+        remove_track_loop_clone(&call).await;
+        let call_lock = call.lock().await;
+        let queue = call_lock.queue();
+        if queue.current().is_none() {
+            Some("Nothing to skip.".to_string())
+        } else {
+            queue.skip().err().map(|e| format!("⚠️ {e}"))
+        }
     } else {
         let call_lock = call.lock().await;
         let queue = call_lock.queue();
@@ -1223,19 +1334,23 @@ pub async fn handle_component_interaction(
                 }
                 None => Some("Nothing is playing.".to_string()),
             },
-            custom_id::SKIP => {
-                if queue.current().is_none() {
-                    Some("Nothing to skip.".to_string())
-                } else {
-                    queue.skip().err().map(|e| format!("⚠️ {e}"))
-                }
-            }
             custom_id::SHUFFLE => {
                 use rand::seq::SliceRandom;
                 let shuffled_count = queue.modify_queue(|tracks| {
-                    let tail_len = tracks.len().saturating_sub(1);
+                    // Index 1 is reserved for `LoopMode::Track`'s
+                    // pre-emptive clone when one is present; leave it in
+                    // place and only shuffle what's genuinely upcoming.
+                    let start_idx = if tracks
+                        .get(1)
+                        .is_some_and(|t| t.data::<TrackMeta>().is_loop_clone)
+                    {
+                        2
+                    } else {
+                        1
+                    };
+                    let tail_len = tracks.len().saturating_sub(start_idx);
                     if tail_len > 1 {
-                        tracks.make_contiguous()[1..].shuffle(&mut rand::thread_rng());
+                        tracks.make_contiguous()[start_idx..].shuffle(&mut rand::thread_rng());
                     }
                     tail_len
                 });
