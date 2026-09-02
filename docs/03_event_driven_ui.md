@@ -43,6 +43,16 @@ The coexistence of two handlers (`PanelUpdater` and `LoopHandler`) on `TrackEven
 
 `refresh_panel` **edits in place** with `edit_message` if the panel message already exists, and sends a new one if it doesn't. An earlier version deleted and resent the message every time a new track started (aiming to make the panel "follow" to the bottom of the channel), but this was reverted because the channel would get spammed every time the track changed or seeked (since `seek_to` is technically a new `Track` too). The demand to bring the panel back to the bottom still exists, so that is handled by the `/nowplaying` command explicitly "deleting the old message and sending a new one".
 
+### Error Type Evaluation: Distinguishing Transient Failures from "Truly Deleted"
+
+Just because `edit_message` fails doesn't mean the panel message was actually deleted. Temporary 502s, rate limits, or network delays from Discord will return the same `Err`. The previous implementation did not distinguish between these and reset `GuildPlayerState::now_playing_message` to `None` on every failure. Consequently, the next `refresh_panel` call would mistakenly assume "the panel doesn't exist yet" and send a new message, causing a **panel duplication bug** where two or more panels coexisted in the same guild.
+
+Currently, the `player/ui.rs::is_not_found(err: &serenity::Error) -> bool` helper returns `true` only for HTTP status 404, or Discord error codes `10008` (Unknown Message) / `10003` (Unknown Channel)—responses that definitively indicate "the target truly does not exist." `refresh_panel` resets `now_playing_message` to `None` only when this check is `true`. For all other errors (treated as transient), it merely logs a `tracing::warn!` and does not reset the ID. By strictly adhering to "recreate only when truly deleted," duplication is prevented.
+
+### Lock Scopes: Snapshot, Drop, then Call Discord API Lock-Free
+
+`refresh_panel` is structured in three stages: "① Snapshot `channel_id`/`message_id`/`loop_mode` from `state` and immediately release the lock → ② Snapshot the queue state from `call` and immediately release the lock → ③ Assemble the Embed/Components and call the Discord API without holding any locks." If you `.await` network I/O like `edit_message`/`send_message` while holding `state.lock().await` or `call.lock().await`, any rate limits or delays will cause other operations in the same guild (button presses, other `refresh_panel` calls, etc.) to block for a long time waiting for the lock. Therefore, the design is unified to always release locks before I/O. The lock is re-acquired only briefly when writing back the transmission result (the new message ID, or resetting via `is_not_found`). See Trap 5 in `04_pitfalls.md` for details and generalized lessons.
+
 ## Button Processing: Acknowledge First, Update Panel Separately
 
 `player::handle_component_interaction` handles all buttons on the Now Playing panel (⏪/⏯️/⏩/🔁/⏭/🔀) in one place. There are two clever points in the flow.

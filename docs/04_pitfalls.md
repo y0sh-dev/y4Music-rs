@@ -69,3 +69,33 @@ if let Some(pause) = should_be_paused
 ```
 
 This is a relatively new syntax that allows straightforwardly chaining `if let`s with `&&`. It flattens places that previously required nested `if let`s or constructs like `match (a, b) { (Some(x), Some(y)) => ..., _ => {} }`. It is explicitly mentioned here because readers with slightly older Rust knowledge might pause for a moment wondering "why are `if let`s connected with `&&`?".
+
+## Trap 5: Network I/O While Holding Asynchronous Locks
+
+### Symptom
+
+When HTTP requests to the Discord API (e.g., `edit_message`, `send_message`, `say`) encounter rate limits or temporary delays, other requests in the same guild—such as someone pressing a panel button, or another event calling `refresh_panel`—appear to freeze inexplicably. They don't error out; they just hang until they time out.
+
+### Cause
+
+If you `.await` external I/O while holding a `MutexGuard` from `tokio::sync::Mutex`, no other task can lock that same `Mutex` until the I/O completes. Because `GuildPlayerState` and `Call` are shared per guild via a single `Arc<Mutex<..>>`, code like "holding `state.lock().await` while doing `channel_id.edit_message(..).await`" forces all other operations in that guild to wait for the lock for the duration of that I/O (hundreds of milliseconds, or much longer during an outage). Unlike local lock operations, network I/O completion times cannot be controlled, making them prone to unpredictable, long-duration locks.
+
+### Solution: Snapshot, `drop`, then I/O Lock-Free
+
+```rust
+// player/ui.rs::refresh_panel (excerpt)
+let (channel_id, message_id, loop_mode) = {
+    let state = state_arc.lock().await;
+    let Some(channel_id) = state.text_channel else {
+        return;
+    };
+    (channel_id, state.now_playing_message, state.loop_mode)
+}; // The state lock is released here
+
+// Call the Discord API without holding any locks
+channel_id.edit_message(http, message_id, edit).await;
+```
+
+Extract the necessary values inside a `{ .. }` block, and let the guard scope out and immediately `drop` when exiting the block. Only re-acquire the lock briefly later if you need to write back the result of the I/O call (like recording a new message ID). `refresh_panel`, `cleanup_guild`, and `handle_voice_state_update` in `player/ui.rs` are all standardized to this pattern.
+
+**Lesson**: The scope of a `MutexGuard` does not necessarily have to match the scope of "the data you want to protect with that lock." The lock is only needed for the exact moment of reading or writing shared data; there is no reason to keep holding it through subsequent I/O. Strictly adhering to the pattern of "Acquire lock → Extract needed values → Release immediately → Perform I/O after releasing" is highly recommended.
