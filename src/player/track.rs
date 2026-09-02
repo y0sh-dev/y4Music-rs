@@ -66,11 +66,16 @@ pub async fn ensure_track_loop_clone(call: &Arc<Mutex<Call>>, extra_args: &[Stri
     let Some(current) = call.queue().current() else {
         return;
     };
-    let already_topped_up = call
-        .queue()
-        .current_queue()
-        .get(1)
-        .is_some_and(|handle| handle.data::<TrackMeta>().is_loop_clone);
+    // A direct `modify_queue` peek at index 1, rather than
+    // `current_queue()` (which clones the *entire* queue into a fresh
+    // `Vec` just to look at one slot), so this stays O(1) regardless of
+    // queue length -- worth caring about since this runs on every
+    // `LoopMode::Track` lap.
+    let already_topped_up = call.queue().modify_queue(|tracks| {
+        tracks
+            .get(1)
+            .is_some_and(|t| t.data::<TrackMeta>().is_loop_clone)
+    });
     if already_topped_up {
         return;
     }

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use poise::serenity_prelude as serenity;
+use reqwest::StatusCode;
 use songbird::Call;
 use songbird::tracks::PlayMode;
 use tokio::sync::Mutex;
@@ -213,9 +214,35 @@ pub fn disabled_control_panel_components(loop_mode: LoopMode) -> Vec<serenity::C
     ]
 }
 
+/// Whether `err` means the panel message (or its channel) is genuinely
+/// gone -- a 404, or Discord error code `10008` (Unknown Message) /
+/// `10003` (Unknown Channel) -- as opposed to a transient failure (a 502,
+/// a rate limit, a network blip) that says nothing about whether the
+/// message still exists. Only the former should ever clear
+/// `GuildPlayerState::now_playing_message`; treating a transient error the
+/// same way was `refresh_panel`'s "panel splits into two" bug -- the next
+/// refresh would see no message on record and send a brand new one
+/// alongside the old (still very much alive) one.
+fn is_not_found(err: &serenity::Error) -> bool {
+    let serenity::Error::Http(serenity::HttpError::UnsuccessfulRequest(response)) = err else {
+        return false;
+    };
+    response.status_code == StatusCode::NOT_FOUND || matches!(response.error.code, 10008 | 10003)
+}
+
 /// Rebuilds and posts/edits the Now Playing panel for a guild from its
 /// call's current queue state. Always edits the existing message in place,
 /// sending a fresh one only if there is none yet.
+///
+/// Three phases, none of which overlap: ① snapshot what's needed from
+/// `state` and drop its lock, ② snapshot the queue and drop `call`'s lock,
+/// ③ build the embed/components and talk to Discord with *no* lock held.
+/// Locks are only ever briefly re-taken afterward to record the outcome
+/// (a new message's id, or clearing a genuinely-gone one -- see
+/// `is_not_found`). Keeping the Discord round-trip out of both critical
+/// sections means a concurrent caller that needs the same guild's `state`
+/// (a button press, another refresh) never sits blocked on this one's
+/// network I/O.
 pub async fn refresh_panel(
     http: &serenity::Http,
     guild_id: serenity::GuildId,
@@ -225,11 +252,17 @@ pub async fn refresh_panel(
     let Some(state_arc) = guild_players.get(&guild_id).map(|entry| entry.clone()) else {
         return;
     };
-    let mut state = state_arc.lock().await;
-    let Some(channel_id) = state.text_channel else {
-        return;
+
+    // ① `state` snapshot.
+    let (channel_id, message_id, loop_mode) = {
+        let state = state_arc.lock().await;
+        let Some(channel_id) = state.text_channel else {
+            return;
+        };
+        (channel_id, state.now_playing_message, state.loop_mode)
     };
 
+    // ② `call`/queue snapshot.
     let snapshot = call.lock().await.queue().current_queue();
     let current = snapshot.first();
     let next_title = snapshot
@@ -239,8 +272,8 @@ pub async fn refresh_panel(
     // position 1 of the queue's remaining length.
     let queue_position = 1usize;
     let queue_total = snapshot.len().max(1);
-    let loop_mode = state.loop_mode;
 
+    // ③ Build with no locks held, then call Discord.
     let (embed, components) = match current {
         Some(handle) => {
             let meta = handle.data::<TrackMeta>();
@@ -263,25 +296,30 @@ pub async fn refresh_panel(
         ),
     };
 
-    match state.now_playing_message {
+    match message_id {
         Some(message_id) => {
             let edit = serenity::EditMessage::new()
                 .embed(embed)
                 .components(components);
-            if channel_id
-                .edit_message(http, message_id, edit)
-                .await
-                .is_err()
-            {
-                state.now_playing_message = None;
+            if let Err(e) = channel_id.edit_message(http, message_id, edit).await {
+                if is_not_found(&e) {
+                    state_arc.lock().await.now_playing_message = None;
+                } else {
+                    tracing::warn!(
+                        "Failed to edit Now Playing panel message {message_id} in guild {guild_id} (leaving it on record; treating as transient): {e}"
+                    );
+                }
             }
         }
         None => {
             let msg = serenity::CreateMessage::new()
                 .embed(embed)
                 .components(components);
-            if let Ok(sent) = channel_id.send_message(http, msg).await {
-                state.now_playing_message = Some(sent.id);
+            match channel_id.send_message(http, msg).await {
+                Ok(sent) => state_arc.lock().await.now_playing_message = Some(sent.id),
+                Err(e) => tracing::warn!(
+                    "Failed to send a new Now Playing panel message in guild {guild_id}: {e}"
+                ),
             }
         }
     }
@@ -303,19 +341,32 @@ pub async fn cleanup_guild(
     let had_call = manager.get(guild_id).is_some();
 
     if let Some(state_arc) = &state_arc {
-        let mut state = state_arc.lock().await;
-        if let Some(task) = state.empty_channel_leave_task.take() {
-            abort_unless_self(task);
-        }
-        stop_progress_ticker(&mut state);
-        stop_idle_leave_task(&mut state);
-        if let (Some(message_id), Some(channel_id)) =
-            (state.now_playing_message.take(), state.text_channel)
-        {
+        // Snapshot what's needed and drop `state`'s lock before the Discord
+        // call below, so a concurrent holder of this same `Arc` (e.g. an
+        // in-flight `refresh_panel`) never blocks on it for that network
+        // round-trip.
+        let goodbye_target = {
+            let mut state = state_arc.lock().await;
+            if let Some(task) = state.empty_channel_leave_task.take() {
+                abort_unless_self(task);
+            }
+            stop_progress_ticker(&mut state);
+            stop_idle_leave_task(&mut state);
+            match (state.now_playing_message.take(), state.text_channel) {
+                (Some(message_id), Some(channel_id)) => Some((message_id, channel_id)),
+                _ => None,
+            }
+        };
+
+        if let Some((message_id, channel_id)) = goodbye_target {
             let edit = serenity::EditMessage::new()
                 .embed(goodbye_embed())
                 .components(Vec::new());
-            let _ = channel_id.edit_message(http, message_id, edit).await;
+            if let Err(e) = channel_id.edit_message(http, message_id, edit).await {
+                tracing::warn!(
+                    "Failed to edit panel message {message_id} to the goodbye embed in guild {guild_id}: {e}"
+                );
+            }
         }
     }
 
@@ -496,52 +547,71 @@ pub async fn handle_voice_state_update(
     };
 
     if human_count == 0 {
-        let mut state = state_arc.lock().await;
-        let needs_new_timer = state
-            .empty_channel_leave_task
-            .as_ref()
-            .is_none_or(|t| t.is_finished());
+        // Snapshotted under a short-lived lock, dropped before the `say`
+        // below and before spawning the timer -- neither needs `state`
+        // held, and the timer's own closure takes its own lock when it
+        // eventually fires.
+        let needs_new_timer = {
+            let state = state_arc.lock().await;
+            state
+                .empty_channel_leave_task
+                .as_ref()
+                .is_none_or(|t| t.is_finished())
+        };
         if needs_new_timer {
             tracing::info!(
                 "guild {guild_id} is now empty of humans; leaving in {}s unless someone rejoins.",
                 EMPTY_CHANNEL_LEAVE_DELAY.as_secs()
             );
-            if let Some(text_channel) = state.text_channel {
-                let _ = text_channel
+            let text_channel = state_arc.lock().await.text_channel;
+            if let Some(text_channel) = text_channel
+                && let Err(e) = text_channel
                     .say(
                         &ctx.http,
                         "Everyone left... I'll leave automatically in 30 seconds.",
                     )
-                    .await;
+                    .await
+            {
+                tracing::warn!("Failed to post the empty-channel notice in guild {guild_id}: {e}");
             }
             let http = ctx.http.clone();
-            let guild_players = guild_players.clone();
-            let manager = manager.clone();
-            state.empty_channel_leave_task = Some(tokio::spawn(async move {
+            let guild_players_for_task = guild_players.clone();
+            let manager_for_task = manager.clone();
+            let task = tokio::spawn(async move {
                 tokio::time::sleep(EMPTY_CHANNEL_LEAVE_DELAY).await;
-                if manager.get(guild_id).is_some() {
+                if manager_for_task.get(guild_id).is_some() {
                     tracing::info!(
                         "Empty-channel timer fired for guild {guild_id}; still connected with no one there, leaving now."
                     );
-                    cleanup_guild(&http, guild_id, &guild_players, &manager).await;
+                    cleanup_guild(&http, guild_id, &guild_players_for_task, &manager_for_task)
+                        .await;
                 } else {
                     tracing::info!(
                         "Empty-channel timer fired for guild {guild_id}, but songbird no longer reports an active call; nothing to do."
                     );
                 }
-            }));
+            });
+            state_arc.lock().await.empty_channel_leave_task = Some(task);
         }
     } else {
-        let mut state = state_arc.lock().await;
-        if let Some(task) = state.empty_channel_leave_task.take()
-            && !task.is_finished()
-        {
-            abort_unless_self(task);
-            if let Some(text_channel) = state.text_channel {
-                let _ = text_channel
-                    .say(&ctx.http, "Welcome back! Canceling auto-leave.")
-                    .await;
+        // Same pattern: take (and possibly abort) the timer under a
+        // short-lived lock, then drop it before the `say`.
+        let text_channel_for_welcome = {
+            let mut state = state_arc.lock().await;
+            match state.empty_channel_leave_task.take() {
+                Some(task) if !task.is_finished() => {
+                    abort_unless_self(task);
+                    state.text_channel
+                }
+                _ => None,
             }
+        };
+        if let Some(text_channel) = text_channel_for_welcome
+            && let Err(e) = text_channel
+                .say(&ctx.http, "Welcome back! Canceling auto-leave.")
+                .await
+        {
+            tracing::warn!("Failed to post the welcome-back notice in guild {guild_id}: {e}");
         }
     }
 
@@ -757,7 +827,11 @@ pub async fn handle_component_interaction(
         let followup = serenity::CreateInteractionResponseFollowup::new()
             .content(note)
             .ephemeral(true);
-        let _ = interaction.create_followup(ctx, followup).await;
+        if let Err(e) = interaction.create_followup(ctx, followup).await {
+            tracing::warn!(
+                "Failed to send a panel button's ephemeral followup in guild {guild_id}: {e}"
+            );
+        }
     }
 
     // Pause/resume and loop-toggle emit no `TrackEvent`, so refresh here
