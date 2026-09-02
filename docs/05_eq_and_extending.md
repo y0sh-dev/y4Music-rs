@@ -17,19 +17,23 @@ An FFmpeg `-af` filtergraph is originally just a single string, and you can't te
 
 ```rust
 pub struct EqProfile {
+    pub pre_gain_db: f64,
     pub resample_precision: u32,
     pub bands: Vec<EqBand>,
     pub sub_boost: Option<SubBoost>,
     pub stereo_width: Option<StereoWidth>,
     pub echo: Option<Echo>,
+    pub lowpass_hz: Option<f64>,
     pub compand: Compand,
     pub loudnorm: Loudnorm,
 }
 
 impl EqProfile {
-    pub fn render(&self) -> String { /* concatenates aresample,anequalizer,asubboost,... */ }
+    pub fn render(&self) -> String { /* concatenates volume,aresample,anequalizer,lowpass,asubboost,...,compand,loudnorm */ }
 }
 ```
+
+The order assembled by `render()` is fixed to the "acoustically correct" signal path: `volume` (Pre-Gain) → `aresample` → `anequalizer` (EQ bands) → `lowpass` (only if `Some`) → (`asubboost`/`extrastereo`/`aecho`, all currently unused) → `compand` → `loudnorm`. Placing Pre-Gain at the very beginning shaves off headroom before EQ boosting, and placing Lowpass immediately after anequalizer prevents high-frequency artifacts left by the EQ from bleeding into subsequent stages (compressor/loudness normalization).
 
 Places where bands or effects are `Option`/`Vec` indicate the intention "not used in that mode". For example, `balanced_profile()` sets `sub_boost`/`stereo_width`/`echo` all to `None`, creating a simple configuration of just raw band correction and normalization.
 
@@ -37,6 +41,7 @@ Places where bands or effects are `Option`/`Vec` indicate the intention "not use
 
 | Parameter | Balanced | Hi-Fi |
 |---|---|---|
+| Pre-Gain (`volume`) | -6dB | -6dB |
 | Resample Precision | 24 | 33 |
 | Band 1: Sub-Bass (Foundation) | 60Hz / w15 / +1.5dB | 60Hz / w40 / +1.5dB |
 | Band 2: Mid-Bass (Mud Cut) | — | 250Hz / w150 / -1.0dB |
@@ -44,11 +49,12 @@ Places where bands or effects are `Option`/`Vec` indicate the intention "not use
 | Band 4: Upper-Mid (Harshness Cut) | — | 3000Hz / w1000 / -0.5dB |
 | Band 5: Presence (Clarity) | — | 8000Hz / w2000 / +1.5dB |
 | Band 6: Air (Sparkle) | — | 14000Hz / w3000 / +1.0dB |
+| Lowpass (`lowpass`) | — | 16000Hz |
 | Sub-bass Boost (`asubboost`) | — | Removed |
 | Stereo Width (`extrastereo`) | — | Removed |
 | Echo (`aecho`) | — | Removed |
 | Compressor | Gentle (attack 0.02s) | Unified with Balanced (attack 0.02s) |
-| Loudness Target | I=-18 LUFS / LRA=10 / TP=-2.0dB | I=-18 LUFS / LRA=11 / TP=-1.5dB |
+| Loudness Target | I=-16 LUFS / LRA=10 / TP=-2.0dB | I=-16 LUFS / LRA=11 / TP=-1.5dB |
 
 ### Why we shifted from "Additive EQ" to "Subtractive EQ"
 
@@ -56,7 +62,15 @@ The previous Hi-Fi profile was configured to **boost all three bands** (Bass/Mid
 
 The new 6-band configuration, conversely, is primarily based on **subtraction**. Cutting the 250Hz band (Mid-Bass) by -1.0dB removes the "muddiness" caused by the overlapping overtones of the kick/bass and the low-end of vocals. Cutting the 3000Hz band (Upper-Mid) by -0.5dB prevents listening fatigue; this is the frequency range human hearing is most sensitive to, and boosting it creates perceived loudness but easily results in a "harsh" or "digital" sound over long listening sessions. We only boost three bands: Sub-Bass (foundation), Presence (clarity), and Air (sparkle), shifting to a subtractive-first design: "cut what needs to be cut, and only add what is necessary."
 
-By standardizing `loudnorm` to `I=-18 LUFS` (the same as Balanced), both modes secure enough headroom (margin before clipping) without pushing the loudness too high. The Hi-Fi mode is tuned to retain more dynamics (dynamic range) than Balanced by setting `LRA` (Loudness Range) slightly wider and `TP` (True Peak limit) slightly looser.
+By standardizing `loudnorm` to `I=-16 LUFS`, both modes secure enough headroom (margin before clipping) without pushing the loudness too high. The Hi-Fi mode is tuned to retain more dynamics (dynamic range) than Balanced by setting `LRA` (Loudness Range) slightly wider and `TP` (True Peak limit) slightly looser.
+
+### Headroom Securing via Pre-Gain (-6dB)
+
+The `volume=-6dB` placed at the very beginning of `EqProfile::render()` drops the volume by -6dB before `anequalizer`. This eliminates the risk of subsequent EQ band boosts (e.g., `+dB` for Sub-Bass/Presence/Air) pushing the sample to 0dBFS and causing digital clipping. Especially with inherently loud tracks (like J-Pop/Nightcore mastered for high loudness), boosting multiple bands simultaneously easily stacks dB, leading to clipping without Pre-Gain.
+
+### Encoder Load Reduction via Lowpass (16000Hz) for Nightcore
+
+The `lowpass_hz: Some(16_000.0)` in Hi-Fi inserts `lowpass=f=16000` immediately after `anequalizer`, cutting off high-frequency components above 16kHz, which are mostly inaudible. High-entropy tracks with increased pitch/tempo, such as Nightcore, tend to contain a massive amount of unnecessary noise-like components in this band. Passing this directly to Discord's Opus encoder inflates the bitrate requirement, making the packets more likely to be rejected by the SFU's bandwidth limits (Token Bucket, see `commands::playback::resolve_target_bitrate`), which manifests as playback stuttering. By cutting off this acoustically negligible band first, the load on the encoder is substantially reduced. The Balanced mode remains `lowpass_hz: None` and does not apply this countermeasure.
 
 ## `EQ_HIFI_FILTER` Environment Variable: A raw string loophole bypassing structs
 
