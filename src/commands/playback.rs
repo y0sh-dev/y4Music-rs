@@ -121,14 +121,15 @@ pub(crate) async fn ensure_call_raw(
 ) -> Result<Arc<TokioMutex<Call>>, Error> {
     let call = manager.join(guild_id, voice_channel_id).await?;
 
+    // Resolved before taking *any* lock below -- it may need a network
+    // round-trip on a cache miss, and neither `state`'s nor `call`'s lock
+    // should sit held across that.
+    let target_bitrate = resolve_target_bitrate(&cache, &http, guild_id, voice_channel_id).await;
+
     // Drop the DashMap guard before locking the inner tokio Mutex below.
     let state_arc = guild_players.entry(guild_id).or_default().clone();
     let mut state = state_arc.lock().await;
     state.text_channel = Some(post_channel_id);
-
-    // Resolved before taking the call lock, since it may need a network
-    // round-trip on a cache miss.
-    let target_bitrate = resolve_target_bitrate(&cache, &http, guild_id, voice_channel_id).await;
 
     let mut call_lock = call.lock().await;
     call_lock.set_bitrate(target_bitrate);
