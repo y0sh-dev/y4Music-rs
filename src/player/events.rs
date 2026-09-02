@@ -91,7 +91,7 @@ impl SongbirdEventHandler for PlaybackErrorNotifier {
         let channel_id = state_arc.lock().await.text_channel?;
 
         for (state, handle) in *track_ctx {
-            let title = handle.data::<TrackMeta>().title.clone();
+            let title = &handle.data::<TrackMeta>().title;
             let detail = match &state.playing {
                 PlayMode::Errored(e) => e.to_string(),
                 other => format!("{other:?}"),
