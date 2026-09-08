@@ -1,24 +1,22 @@
-# 05. EQ Settings and Extension Guide
+# 05. EQ Configuration & Extension Guide
 
-## `eq.rs`: Expressing "what changes the sound where" with types
+## `eq.rs`: encoding "what changes where" as types
 
-An FFmpeg `-af` filtergraph is originally just a single string, and you can't tell which parameter corresponds to which effect without reading the ffmpeg documentation. `src/eq.rs` breaks this down into structs, making the field names themselves act as documentation.
+FFmpeg's `-af` filtergraph is, at bottom, just one opaque string -- which parameter maps to which effect is only discoverable by reading ffmpeg's own docs. `src/eq.rs` decomposes it into structs so the field names themselves double as documentation.
 
-| Struct | Corresponding ffmpeg filter | Meaning |
+| Struct | ffmpeg filter | Meaning |
 |---|---|---|
-| `EqBand { freq_hz, width_hz, gain_db }` | 1 band of `anequalizer` | Boosts/cuts a specific frequency band (Bass/Mid/Treble, etc.) |
-| `SubBoost { cutoff_hz, feedback }` | `asubboost` | Reinforces low end below the cutoff |
-| `StereoWidth { m }` | `extrastereo` | Stereo image widening (`1.0` is unchanged) |
-| `Echo { in_gain, out_gain, delay_ms, decay }` | `aecho` | Adds echo/spatial ambience |
-| `Compand { attack_s, decay_s, points }` | `compand` | Dynamic range compression (`points` is an input/output dB piecewise curve) |
-| `Loudnorm { integrated_lufs, range_lu, true_peak_dbtp }` | `loudnorm` | EBU R128 compliant loudness normalization |
+| `EqBand { freq_hz, width_hz, gain_db }` | one `anequalizer` band | Boost/cut a specific frequency band |
+| `SubBoost { cutoff_hz, feedback }` | `asubboost` | Reinforce low end below the cutoff |
+| `StereoWidth { m }` | `extrastereo` | Stereo image width (`1.0` = unchanged) |
+| `Echo { in_gain, out_gain, delay_ms, decay }` | `aecho` | Adds echo / spatial ambience |
+| `Compand { attack_s, decay_s, points, soft_knee, delay_s }` | `compand` | Dynamic range compression. `points` is the input/output dB transfer curve; `soft_knee` rounds the bend at each breakpoint instead of a hard corner; `delay_s` is a lookahead -- it holds the signal briefly so the level detector sees a transient *before* the gain stage reacts to it |
+| `Loudnorm { integrated_lufs, range_lu, true_peak_dbtp }` | `loudnorm` | EBU R128 loudness normalization |
 
-`EqProfile`, which groups these together, assembles the final `-af` string:
+`EqProfile` assembles these into the final `-af` string:
 
 ```rust
 pub struct EqProfile {
-    pub pre_gain_db: f64,
-    pub resample_precision: u32,
     pub bands: Vec<EqBand>,
     pub sub_boost: Option<SubBoost>,
     pub stereo_width: Option<StereoWidth>,
@@ -29,52 +27,59 @@ pub struct EqProfile {
 }
 
 impl EqProfile {
-    pub fn render(&self) -> String { /* concatenates volume,aresample,anequalizer,lowpass,asubboost,...,compand,loudnorm */ }
+    pub fn render(&self) -> String { /* joins aresample,anequalizer,lowpass,asubboost,...,compand,loudnorm */ }
 }
 ```
 
-The order assembled by `render()` is fixed to the "acoustically correct" signal path: `volume` (Pre-Gain) → `aresample` → `anequalizer` (EQ bands) → `lowpass` (only if `Some`) → (`asubboost`/`extrastereo`/`aecho`, all currently unused) → `compand` → `loudnorm`. Placing Pre-Gain at the very beginning shaves off headroom before EQ boosting, and placing Lowpass immediately after anequalizer prevents high-frequency artifacts left by the EQ from bleeding into subsequent stages (compressor/loudness normalization).
+There is no `pre_gain_db` and no `resample_precision` field anymore -- both were removed (see "Removal of Pre-Gain" below). `render()` now opens every profile with a single fixed resample stage, `aresample=48000:resampler=swr:precision=28:cutoff=0.97`, regardless of profile; no per-profile precision knob exists.
 
-Places where bands or effects are `Option`/`Vec` indicate the intention "not used in that mode". For example, `balanced_profile()` sets `sub_boost`/`stereo_width`/`echo` all to `None`, creating a simple configuration of just raw band correction and normalization.
+`render()`'s assembly order is the signal-flow order: `aresample` (fixed) -> `anequalizer` (EQ bands) -> `lowpass` (only if `Some`) -> (`asubboost`/`extrastereo`/`aecho`, all unused by the current profiles) -> `compand` -> `loudnorm`. Lowpass sits right after `anequalizer` so it trims whatever high-frequency energy the EQ bands didn't already remove before that energy reaches the compressor/loudness stage.
+
+Fields that are `Option`/`Vec` signal "this profile doesn't use it" -- e.g. `balanced_profile()` leaves `sub_boost`/`stereo_width`/`echo` all `None`, keeping it to plain band correction plus normalization.
 
 ## Balanced vs Hi-Fi Settings Comparison
 
 | Parameter | Balanced | Hi-Fi |
 |---|---|---|
-| Pre-Gain (`volume`) | -6dB | -6dB |
-| Resample Precision | 24 | 33 |
-| Band 1: Sub-Bass (Foundation) | 60Hz / w15 / +1.5dB | 60Hz / w40 / +1.5dB |
-| Band 2: Mid-Bass (Mud Cut) | — | 250Hz / w150 / -1.0dB |
-| Band 3: Mid (Anchor) | — | 1000Hz / w500 / 0dB |
-| Band 4: Upper-Mid (Harshness Cut) | — | 3000Hz / w1000 / -0.5dB |
-| Band 5: Presence (Clarity) | — | 8000Hz / w2000 / +1.5dB |
-| Band 6: Air (Sparkle) | — | 14000Hz / w3000 / +1.0dB |
-| Lowpass (`lowpass`) | — | 16000Hz |
-| Sub-bass Boost (`asubboost`) | — | Removed |
-| Stereo Width (`extrastereo`) | — | Removed |
-| Echo (`aecho`) | — | Removed |
-| Compressor | Gentle (attack 0.02s) | Unified with Balanced (attack 0.02s) |
-| Loudness Target | I=-16 LUFS / LRA=10 / TP=-2.0dB | I=-16 LUFS / LRA=11 / TP=-1.5dB |
+| Resample | `precision=28:cutoff=0.97` (fixed, both profiles) | same |
+| Band 1 | 60Hz / w15 / +1.5dB | 60Hz / w50 / +0.8dB |
+| Band 2 | -- | 120Hz / w100 / +0.4dB |
+| Band 3 | -- | 250Hz / w180 / -0.5dB |
+| Band 4 | -- | 500Hz / w350 / +0.3dB |
+| Band 5 | -- | 2000Hz / w1400 / +0.2dB |
+| Band 6 | -- | 5500Hz / w3500 / -0.4dB |
+| Band 7 | -- | 8000Hz / w5500 / +0.4dB |
+| Band 8 | -- | 11000Hz / w7500 / +0.3dB |
+| Band 9 | -- | 14000Hz / w9500 / +0.2dB |
+| Lowpass (`lowpass`) | -- | 18000Hz |
+| Sub-bass boost (`asubboost`) | -- | dropped |
+| Stereo width (`extrastereo`) | -- | dropped |
+| Echo (`aecho`) | -- | dropped |
+| Compressor attack / decay | 0.02s / 0.1s | 0.01s / 0.15s |
+| Compressor points | -80/-80\|-35/-35\|0/-5 | -80/-80\|-18/-18\|0/-2.5 |
+| Compressor soft-knee | 0.01 | 6.0 |
+| Compressor lookahead (`delay_s`) | 0s | 0.01s |
+| Loudness target | I=-16 LUFS / LRA=10 / TP=-2.0dB | I=-16 LUFS / LRA=11 / TP=-1.5dB |
 
-### Why we shifted from "Additive EQ" to "Subtractive EQ"
+### Removal of Pre-Gain (Leveraging 32-bit Float)
 
-The previous Hi-Fi profile was configured to **boost all three bands** (Bass/Mid/Treble), layered with spatial effects like `asubboost`, `extrastereo`, and `aecho`. While the idea of "adding missing frequencies" is intuitive, boosting multiple bands simultaneously stacks dB levels, increasing the risk of clipping. Furthermore, spatial effects increase CPU load, yet their impact is hard to discern once passed through Discord's Opus re-encoding.
+The previous `-6dB` pre-gain (ffmpeg's `volume` filter, applied before any EQ boost) existed to protect fixed-point headroom: without it, a boosted band could push a sample past 0dBFS and clip. FFmpeg's internal pipeline here runs in `f32le` (32-bit float), where intermediate values aren't clamped to `[-1.0, 1.0]` between filter stages -- a band boost can exceed 0dBFS mid-chain without clipping, and `loudnorm` at the end of the chain still receives the signal's full dynamic range intact. Pre-gain bought no real protection on this pipeline; it only shifted the compander's effective input level, which is exactly the mismatch the DSP audit flagged as skewing `compand`'s behavior. Removing it means one less parameter to keep in sync between profiles and no more implicit level offset for the compressor to compensate for.
 
-The new 6-band configuration, conversely, is primarily based on **subtraction**. Cutting the 250Hz band (Mid-Bass) by -1.0dB removes the "muddiness" caused by the overlapping overtones of the kick/bass and the low-end of vocals. Cutting the 3000Hz band (Upper-Mid) by -0.5dB prevents listening fatigue; this is the frequency range human hearing is most sensitive to, and boosting it creates perceived loudness but easily results in a "harsh" or "digital" sound over long listening sessions. We only boost three bands: Sub-Bass (foundation), Presence (clarity), and Air (sparkle), shifting to a subtractive-first design: "cut what needs to be cut, and only add what is necessary."
+### Proportional-Q 9-Band EQ
 
-By standardizing `loudnorm` to `I=-16 LUFS`, both modes secure enough headroom (margin before clipping) without pushing the loudness too high. The Hi-Fi mode is tuned to retain more dynamics (dynamic range) than Balanced by setting `LRA` (Loudness Range) slightly wider and `TP` (True Peak limit) slightly looser.
+The prior 6-band design used a handful of fixed absolute `width_hz` values across widely different center frequencies, which produced disproportionately wide skirts at the high end relative to their own frequency. Summed with the neighboring bands' skirts in `anequalizer`'s per-band biquads, that imbalance produced comb-filtering-like ripple in the upper register. The current 9 bands are proportional-Q: `width_hz` is sized relative to `freq_hz` at every band (Q ≈ 1.2-1.5 throughout, e.g. 60Hz/w50 ≈ Q1.2, 14000Hz/w9500 ≈ Q1.47), so each band's skirt scales consistently with its own center frequency instead of ballooning at the top of the spectrum. The result is a smoother, more even mastering curve across the full band, not concentrated cuts/boosts fighting each other in specific registers.
 
-### Headroom Securing via Pre-Gain (-6dB)
+### Lookahead Compression & Soft-Knee
 
-The `volume=-6dB` placed at the very beginning of `EqProfile::render()` drops the volume by -6dB before `anequalizer`. This eliminates the risk of subsequent EQ band boosts (e.g., `+dB` for Sub-Bass/Presence/Air) pushing the sample to 0dBFS and causing digital clipping. Especially with inherently loud tracks (like J-Pop/Nightcore mastered for high loudness), boosting multiple bands simultaneously easily stacks dB, leading to clipping without Pre-Gain.
+The previous compander used a zero-lookahead, effectively hard-knee curve, which reacts to a transient only after it has already happened -- audible as "pumping" (a momentary volume dip/swell) on percussive material, which is common in Nightcore-style high-BPM tracks (kick drums, sharp transients). `Compand::delay_s` (0.01s on Hi-Fi) implements a lookahead: the signal is held briefly so the level detector sees the transient slightly ahead of the gain stage acting on it, letting the compressor start reacting before the peak arrives instead of chasing it. `Compand::soft_knee` (6.0 on Hi-Fi, vs. Balanced's near-hard 0.01) rounds the transition around each breakpoint in `points` rather than bending sharply, so gain reduction eases in instead of snapping on. Together with the faster attack (0.01s) and slower decay (0.15s), this keeps transients controlled without the audible gain-riding of the previous curve.
 
-### Encoder Load Reduction via Lowpass (16000Hz) for Nightcore
+### Lowpass (18000Hz): Reducing Encoder Load (Nightcore Mitigation)
 
-The `lowpass_hz: Some(16_000.0)` in Hi-Fi inserts `lowpass=f=16000` immediately after `anequalizer`, cutting off high-frequency components above 16kHz, which are mostly inaudible. High-entropy tracks with increased pitch/tempo, such as Nightcore, tend to contain a massive amount of unnecessary noise-like components in this band. Passing this directly to Discord's Opus encoder inflates the bitrate requirement, making the packets more likely to be rejected by the SFU's bandwidth limits (Token Bucket, see `commands::playback::resolve_target_bitrate`), which manifests as playback stuttering. By cutting off this acoustically negligible band first, the load on the encoder is substantially reduced. The Balanced mode remains `lowpass_hz: None` and does not apply this countermeasure.
+Hi-Fi's `lowpass_hz: Some(18_000.0)` inserts `lowpass=f=18000` right after `anequalizer`, cutting frequency content above 18kHz that's inaudible to nearly everyone. High-BPM/high-entropy material (Nightcore and similar) packs disproportionate energy in that range; left in, it inflates the Opus encoder's bitrate demand enough to contribute to packet loss under Discord's bandwidth cap (see `commands::playback::resolve_target_bitrate`'s token-bucket limiting), audible as playback stutter. Cutting it above the EQ bands sheds that load before it reaches the compressor/loudness stage, without touching anything a listener would notice. Balanced leaves `lowpass_hz: None` and does not apply this.
 
-## `EQ_HIFI_FILTER` Environment Variable: A raw string loophole bypassing structs
+## `EQ_HIFI_FILTER` Environment Variable: a Raw-String Escape Hatch
 
-The default value for Hi-Fi mode is generated by `eq::default_hifi_profile().render()`, but this is strictly a **fallback when the environment variable is not set**.
+Hi-Fi's default value comes from `eq::default_hifi_profile().render()`, but that's only the **fallback used when the environment variable isn't set**.
 
 ```rust
 // main.rs
@@ -82,24 +87,24 @@ let eq_hifi_filter = std::env::var("EQ_HIFI_FILTER")
     .unwrap_or_else(|_| eq::default_hifi_profile().render());
 ```
 
-If an operator sets an arbitrary `-af` string in `EQ_HIFI_FILTER`, it is used exactly as is, completely bypassing the structs in `eq.rs`. In other words, the structification is merely organizing "how to assemble the default values in code", intentionally preserving the operator's freedom to tune (arbitrary strings not bound by struct types) in actual operation. Conversely, Balanced mode has no environment variable override path like `BALANCED_FILTER` and is always fixed to `balanced_profile()`.
+If an operator sets `EQ_HIFI_FILTER` to an arbitrary `-af` string, it bypasses `eq.rs`'s structs entirely. The structs only organize how the in-code default is assembled; an operator's own tuning freedom (any string, unconstrained by the struct's shape) is deliberately preserved at runtime. Balanced mode has no equivalent override path (no `BALANCED_FILTER`) -- it always uses `balanced_profile()` as-is.
 
 ## Extension Guide
 
-### Adding a new EQ band/effect
+### Adding a new EQ band / effect
 
-1. Add a new struct to `eq.rs` (e.g., `struct Deesser { .. }`) and give it fields corresponding to the ffmpeg filter arguments.
-2. Add a field like `Option<Deesser>` to `EqProfile`.
-3. Inside `EqProfile::render()`, add a branch to concatenate it to the filter string only when it is `Some` (refer to how existing `sub_boost`/`echo` are written).
-4. Set the value only in the profile (`balanced_profile()` / `default_hifi_profile()`) where you want to apply that mode.
-5. Check the generated string with `cargo test` (`eq::tests`) and add expected value assertions if necessary.
+1. Add a new struct to `eq.rs` (e.g. `struct Deesser { .. }`) with fields for the corresponding ffmpeg filter's arguments.
+2. Add an `Option<Deesser>`-shaped field to `EqProfile`.
+3. In `EqProfile::render()`, add a branch that appends to the filter string only when it's `Some` (follow the existing `sub_boost`/`echo` pattern).
+4. Set a value in whichever of `balanced_profile()` / `default_hifi_profile()` should use it.
+5. Run `cargo test` (`eq::tests`) and update/add expected-string assertions as needed.
 
 ### Adding a new slash command
 
-1. Write an `async fn` with `#[poise::command(slash_command, ...)]` in an appropriate file under `src/commands/` (like the existing `playback.rs`, or a new file).
-2. Register it in the vector in `src/commands/mod.rs::all()` (omitting registration won't cause a runtime error, the command just won't appear on Discord, making it hard to notice).
-3. Reuse `commands::playback::ensure_call`/`songbird_manager` if it involves voice operations, or `player::refresh_panel` if it involves panel updates.
+1. Write an `async fn` tagged `#[poise::command(slash_command, ...)]` in the appropriate file under `src/commands/` (an existing file like `playback.rs`, or a new one).
+2. Register it in `src/commands/mod.rs::all()`'s vector (a missed registration fails silently at the Discord UI level, not at runtime, so it's easy to overlook).
+3. Reuse `commands::playback::ensure_call`/`songbird_manager` for voice operations, and `player::refresh_panel` for panel updates.
 
-### Supporting a new audio source (e.g., SoundCloud, etc.)
+### Supporting a new audio source (e.g. SoundCloud)
 
-Currently, `FfmpegEqSource` passes the URL string exactly as is to `yt-dlp -j`, so it is highly likely to work without additional code changes if `yt-dlp` supports the site. If you want to add a custom protocol that `yt-dlp` does not support, you would add a new type implementing `Compose` to `audio_source.rs` and switch the source used in the equivalent of `commands::playback::resolve_and_build_track`. Note that you must apply the seek-related constraints from `02_audio_pipeline.md` (`TrackMeta::start_offset`/`is_seek`) to the new source as well.
+`FfmpegEqSource` currently passes the URL string straight through to `yt-dlp -j`, so any site `yt-dlp` already supports likely works with no code changes. For a custom protocol `yt-dlp` doesn't support, add a new type implementing `Compose` in `audio_source.rs` and switch to it at the equivalent of `commands/playback.rs::resolve_and_build_track`. Apply the same seek-related constraints described in `02_audio_pipeline.md` (`TrackMeta::start_offset`/`is_seek`) to the new source as well.
