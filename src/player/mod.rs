@@ -23,7 +23,7 @@ pub use state::{
 #[allow(unused_imports)]
 pub use track::{
     derive_youtube_thumbnail, ensure_track_loop_clone, remove_track_loop_clone, seek_by, seek_to,
-    youtube_video_id,
+    shuffle_queue_tail, youtube_video_id,
 };
 #[allow(unused_imports)]
 pub use ui::{

@@ -3,10 +3,10 @@
 //! `state` (for `TrackMeta`) and `crate::audio_source`.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use songbird::Call;
-use songbird::tracks::Track;
+use songbird::tracks::{Track, TrackQueue};
 use tokio::sync::Mutex;
 
 use crate::audio_source::FfmpegEqSource;
@@ -133,6 +133,79 @@ pub async fn remove_track_loop_clone(call: &Arc<Mutex<Call>>) {
     });
 }
 
+/// Shuffles only the genuinely upcoming tracks (the queue tail) in place with
+/// a Fisher-Yates pass, using a lightweight non-cryptographic PRNG instead of
+/// pulling in `rand`. Returns the number of tracks in the shuffleable tail.
+///
+/// Index 1 is reserved for `LoopMode::Track`'s pre-emptive clone when one is
+/// present (see `ensure_track_loop_clone`); it stays in place, as does the
+/// currently playing track at index 0. Shared by `/shuffle` and the panel's
+/// SHUFFLE button so their behaviour can't drift apart.
+pub fn shuffle_queue_tail(queue: &TrackQueue) -> usize {
+    queue.modify_queue(|tracks| {
+        let start_idx = shuffle_start_index(
+            tracks
+                .get(1)
+                .is_some_and(|t| t.data::<TrackMeta>().is_loop_clone),
+        );
+        let tail_len = tracks.len().saturating_sub(start_idx);
+        if tail_len > 1 {
+            shuffle_slice(&mut tracks.make_contiguous()[start_idx..]);
+        }
+        tail_len
+    })
+}
+
+/// First index eligible for shuffling: skip index 0 (the current track) and,
+/// when present, index 1 (the `LoopMode::Track` clone).
+fn shuffle_start_index(has_loop_clone_at_1: bool) -> usize {
+    if has_loop_clone_at_1 { 2 } else { 1 }
+}
+
+/// In-place Fisher-Yates over `items`, driven by `Xorshift64` seeded from the
+/// wall clock. Randomness quality is irrelevant here -- this is queue
+/// ordering, not cryptography -- and `rand` is too heavy a dependency for it.
+fn shuffle_slice<T>(items: &mut [T]) {
+    let mut rng = Xorshift64::from_system_time();
+    for i in (1..items.len()).rev() {
+        let j = rng.next_below(i as u64 + 1) as usize;
+        items.swap(i, j);
+    }
+}
+
+/// Fallback seed for `Xorshift64` when the wall clock is unavailable (or
+/// lands exactly on the epoch).
+const XORSHIFT_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Minimal `Xorshift64` PRNG; the shift triple and non-zero guard are from
+/// Marsaglia's original formulation.
+struct Xorshift64(u64);
+
+impl Xorshift64 {
+    fn from_system_time() -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(XORSHIFT_SEED);
+        Self(if nanos == 0 { XORSHIFT_SEED } else { nanos })
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    /// Uniform-enough value in `[0, upper)` via Lemire's multiply-shift
+    /// reduction (no division, negligible bias for small queues).
+    fn next_below(&mut self, upper: u64) -> u64 {
+        ((u128::from(self.next_u64()) * u128::from(upper)) >> 64) as u64
+    }
+}
+
 /// Seeks the currently playing track to an absolute position, by building a
 /// new `Track` (via `FfmpegEqSource::seek_time`) and swapping it in for the
 /// current one -- songbird's native seek doesn't support custom `Compose`
@@ -228,4 +301,40 @@ pub async fn seek_by(
         current_pos.saturating_add(Duration::from_secs(delta_secs as u64))
     };
     seek_to(call, extra_args, target).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{shuffle_slice, shuffle_start_index};
+
+    #[test]
+    fn shuffle_start_index_reserves_current_and_loop_clone() {
+        assert_eq!(shuffle_start_index(false), 1);
+        assert_eq!(shuffle_start_index(true), 2);
+    }
+
+    #[test]
+    fn shuffle_slice_leaves_the_guarded_prefix_and_permutes_only_the_tail() {
+        let mut tracks = [10_u32, 20, 30, 40, 50, 60];
+        let before = tracks;
+        // `true` simulates a `LoopMode::Track` clone sitting at index 1.
+        let start_idx = shuffle_start_index(true);
+
+        shuffle_slice(&mut tracks[start_idx..]);
+
+        assert_eq!(tracks[..start_idx], before[..start_idx]);
+        let mut shuffled_tail = tracks[start_idx..].to_vec();
+        shuffled_tail.sort_unstable();
+        assert_eq!(shuffled_tail, before[start_idx..].to_vec());
+    }
+
+    #[test]
+    fn shuffle_slice_is_a_no_op_for_a_zero_or_one_element_tail() {
+        let mut empty: [u32; 0] = [];
+        shuffle_slice(&mut empty);
+
+        let mut single = [42_u32];
+        shuffle_slice(&mut single);
+        assert_eq!(single, [42]);
+    }
 }

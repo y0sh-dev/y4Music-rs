@@ -37,7 +37,7 @@ pub struct PanelUpdater {
     pub kind: PanelUpdaterKind,
 }
 
-#[async_trait::async_trait]
+#[serenity::async_trait]
 impl SongbirdEventHandler for PanelUpdater {
     async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
         refresh_panel(&self.http, self.guild_id, &self.guild_players, &self.call).await;
@@ -77,7 +77,7 @@ pub struct PlaybackErrorNotifier {
     pub guild_players: Arc<GuildPlayers>,
 }
 
-#[async_trait::async_trait]
+#[serenity::async_trait]
 impl SongbirdEventHandler for PlaybackErrorNotifier {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         let EventContext::Track(track_ctx) = ctx else {
@@ -151,7 +151,7 @@ pub struct LoopHandler {
     pub call: Arc<Mutex<Call>>,
 }
 
-#[async_trait::async_trait]
+#[serenity::async_trait]
 impl SongbirdEventHandler for LoopHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         let EventContext::Track(track_ctx) = ctx else {

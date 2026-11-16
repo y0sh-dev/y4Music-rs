@@ -479,27 +479,8 @@ pub async fn shuffle(ctx: Context<'_>) -> Result<(), Error> {
     };
 
     let shuffled_count = {
-        use rand::seq::SliceRandom;
         let call = call.lock().await;
-        call.queue().modify_queue(|tracks| {
-            // Index 1 is reserved for `LoopMode::Track`'s pre-emptive clone
-            // (see `crate::player::ensure_track_loop_clone`) when one is
-            // present; leave it in place and only shuffle what's
-            // genuinely upcoming.
-            let start_idx = if tracks
-                .get(1)
-                .is_some_and(|t| t.data::<TrackMeta>().is_loop_clone)
-            {
-                2
-            } else {
-                1
-            };
-            let tail_len = tracks.len().saturating_sub(start_idx);
-            if tail_len > 1 {
-                tracks.make_contiguous()[start_idx..].shuffle(&mut rand::thread_rng());
-            }
-            tail_len
-        })
+        crate::player::shuffle_queue_tail(call.queue())
     };
 
     if shuffled_count == 0 {

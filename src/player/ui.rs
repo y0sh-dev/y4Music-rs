@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use poise::serenity_prelude as serenity;
-use reqwest::StatusCode;
 use songbird::Call;
 use songbird::tracks::PlayMode;
 use tokio::sync::Mutex;
@@ -16,7 +15,7 @@ use super::state::{
     PROGRESS_TICK_INTERVAL, TrackMeta, abort_unless_self, stop_idle_leave_task,
     stop_progress_ticker,
 };
-use super::track::{ensure_track_loop_clone, remove_track_loop_clone, seek_by};
+use super::track::{ensure_track_loop_clone, remove_track_loop_clone, seek_by, shuffle_queue_tail};
 
 /// Width (in characters) of the text progress bar `now_playing_embed` renders.
 pub const PROGRESS_BAR_LENGTH: usize = 20;
@@ -227,7 +226,7 @@ fn is_not_found(err: &serenity::Error) -> bool {
     let serenity::Error::Http(serenity::HttpError::UnsuccessfulRequest(response)) = err else {
         return false;
     };
-    response.status_code == StatusCode::NOT_FOUND || matches!(response.error.code, 10008 | 10003)
+    response.status_code.as_u16() == 404 || matches!(response.error.code, 10008 | 10003)
 }
 
 /// Rebuilds and posts/edits the Now Playing panel for a guild from its
@@ -787,25 +786,7 @@ pub async fn handle_component_interaction(
                 None => Some("Nothing is playing.".to_string()),
             },
             custom_id::SHUFFLE => {
-                use rand::seq::SliceRandom;
-                let shuffled_count = queue.modify_queue(|tracks| {
-                    // Index 1 is reserved for `LoopMode::Track`'s
-                    // pre-emptive clone when one is present; leave it in
-                    // place and only shuffle what's genuinely upcoming.
-                    let start_idx = if tracks
-                        .get(1)
-                        .is_some_and(|t| t.data::<TrackMeta>().is_loop_clone)
-                    {
-                        2
-                    } else {
-                        1
-                    };
-                    let tail_len = tracks.len().saturating_sub(start_idx);
-                    if tail_len > 1 {
-                        tracks.make_contiguous()[start_idx..].shuffle(&mut rand::thread_rng());
-                    }
-                    tail_len
-                });
+                let shuffled_count = shuffle_queue_tail(queue);
                 if shuffled_count == 0 {
                     Some("There's nothing queued up next to shuffle.".to_string())
                 } else {

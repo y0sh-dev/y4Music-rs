@@ -37,7 +37,7 @@ pub struct FfmpegEqSource {
     pub seek_time: Option<Duration>,
 }
 
-#[async_trait::async_trait]
+#[poise::serenity_prelude::async_trait]
 impl Compose for FfmpegEqSource {
     fn create(&mut self) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
         Err(AudioStreamError::Unsupported)
