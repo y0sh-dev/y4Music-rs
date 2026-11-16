@@ -4,14 +4,10 @@ version = "0.3.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.104"
-async-trait = "0.1.92"
 dashmap = "6.2.1"
 dotenvy = "0.15.7"
 poise = "0.6.2"
-# Only used for `/shuffle` (Fisher-Yates over the queue tail).
-rand = "0.8"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serenity = { version = "0.12.5", default-features = false, features = [
@@ -25,18 +21,11 @@ serenity = { version = "0.12.5", default-features = false, features = [
 ] }
 songbird = { version = "0.6.0", features = ["driver", "gateway", "builtin-queue"] }
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite"] }
-# Direct dependency (unused directly) to enable container/codec features on
-# songbird's shared symphonia instance via Cargo feature unification.
-symphonia = { version = "0.5", default-features = false, features = [
-    "aac",
-    "isomp4",
-    "mkv",
-    "mp3",
-    "ogg",
-    "pcm",
-    "vorbis",
-    "wav",
-] }
+# Direct dependency (unused directly) kept only to enable `pcm` on songbird's
+# shared symphonia instance via Cargo feature unification: `ffmpeg` handles all
+# container/codec decoding into `f32le` PCM, and songbird only needs `pcm` for
+# its `RawAdapter`.
+symphonia = { version = "0.5", default-features = false, features = ["pcm"] }
 tokio = { version = "1.53.1", features = [
     "io-util",
     "macros",
