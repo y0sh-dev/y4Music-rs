@@ -39,7 +39,7 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Context<'a> = poise::Context<'a, Data, Error>;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt::init();
 
     // Load `.env` if present: current directory first, then the FHS system
@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let token = std::env::var("DISCORD_TOKEN")
-        .map_err(|_| anyhow::anyhow!("DISCORD_TOKEN is not set (see .env.example)"))?;
+        .map_err(|_| "DISCORD_TOKEN is not set (see .env.example)")?;
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "sqlite:///var/lib/y4music-rs/data.db".to_string());
     let test_guild_id = std::env::var("TEST_GUILD_ID")

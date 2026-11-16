@@ -8,7 +8,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 /// Opens (creating if necessary) the SQLite database at `database_url` and
 /// runs any pending migrations from `./migrations`.
-pub async fn init(database_url: &str) -> anyhow::Result<SqlitePool> {
+pub async fn init(database_url: &str) -> Result<SqlitePool, crate::Error> {
     // Ensure the DB file's parent directory exists.
     if let Some(path) = database_url.strip_prefix("sqlite://")
         && let Some(parent) = Path::new(path).parent()
