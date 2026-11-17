@@ -1,4 +1,3 @@
-
 <div align="center">
 
 # y4Music-rs
@@ -17,32 +16,65 @@
 
 ---
 
+## Project Vision & Non-Goals
+
+`y4Music-rs` is built to be a **practical, low-overhead self-hosted Discord Music Bot** for small-to-medium communities—focused on reliable playback, responsive UI, clean audio, and effortless playlist reuse.
+
+* **What it IS**:
+  * A single-binary Rust service using external `yt-dlp` and `ffmpeg` for resilient media resolution and decoding.
+  * Predictable playback with per-user volume/EQ profiles and SQLite-backed personal & server playlists.
+* **Non-Goals** *(kept out of scope to avoid turning the bot into an experimental lab)*:
+  * Multi-tenant SaaS scaling, sharding orchestration, or web dashboards.
+  * Audio-toy bloat (real-time visualizers, dozens of gimmick effects, or over-engineered micro-module splits).
+  * In-process lossy codec/container implementations (handled by `ffmpeg`).
+
+---
+
+## Features
+
+### Implemented 
+* **Playback & Queue Control**: URL/search playback, `/playnext` priority insertion, seeking (`/seek` & panel buttons), `Off` / `Track` / `Queue` loop modes, and queue-tail shuffle.
+* **Stateless Event-Driven UI**: Now Playing panel driven by `songbird` `Play` / `End` events with silent rate-limit cooldowns and 404-safe message tracking.
+* **Per-User Audio Profiles**: Persistent default volume (0–200%) and EQ mode (`Balanced` / `Hi-Fi` Proportional-Q + lookahead `compand` + `loudnorm`) via SQLite.
+* **Personal & Server Playlists**: Streaming playlist import via `yt-dlp`, track reordering/removal, and server-shared playlists with lock & user/role collaborator permissions.
+* **Voice Lifecycle Hygiene**: Auto-leave when the voice channel becomes empty or the queue stays idle, and auto-pause/resume when all listeners are deafened.
+
+### Planned 
+* **Playlist Differential Sync**: Incremental updates when re-importing from the same external playlist URL (avoiding duplicate entries).
+* **Post-Dependency-Trim Verification & Fixes**: Any stability or regression fixes surfaced during `0.3.x` soak testing.
+
+---
+
 ## Architecture Highlights
 
-This bot adopts several aggressive approaches to eliminate the "state inconsistencies" and "network vulnerabilities" commonly found in typical Music Bot designs.
+* **Direct FFmpeg Pipeline**: `yt-dlp` resolves direct CDN links and passes them to `ffmpeg` (`-reconnect`, EQ filtergraph, `f32le` 48 kHz stereo PCM) feeding `songbird`'s `RawAdapter` (`symphonia` `pcm` only).
+* **Stateless Event-Driven UI**: Holds no `is_playing` or `skip_requested` flags; renders directly from `songbird` queue state and track events.
+* **Silent Rate-Limit Protection**: Rapid button clicks within the cooldown window return an empty Acknowledge without spamming ephemeral replies.
 
-* **Direct FFmpeg Pipeline**
-  Bypasses standard wrapper library streaming. `yt-dlp` is used solely to resolve direct CDN links, passing the URL directly to the `ffmpeg` process to handle HTTP communication. This leverages FFmpeg's native, robust network reconnect capabilities (`-reconnect`) while directly applying per-user EQ filters (Balanced / Hi-Fi) at the decoding stage, feeding raw PCM straight into the mixer.
+---
 
-* **Stateless Event-Driven UI**
-  Holds absolutely no internal state flags like `is_playing` or `skip_requested`. The "Now Playing" panel listens exclusively to raw `Play` / `End` events fired from the deepest layer of the audio driver (`songbird`), rendering the actual queue state as-is. This fundamentally eradicates any desync between the UI and the actual playback state.
+## Prerequisites & Configuration
 
-* **Silent Rate-Limit Protection**
-  To combat the biggest enemy of Discord button UIs—API rate limits (429 errors) caused by rapid clicking—it implements a "silent cooldown." Instead of consuming API calls to send warning messages, it silently returns an empty Acknowledge and drops the background process. This keeps the chat clean and minimizes bot load.
+* **Rust** (2024 edition, for building)
+* **ffmpeg** (on `PATH`)
+* **yt-dlp** *(Note: If you encounter `403 Forbidden` due to YouTube changes, using the **nightly build** of `yt-dlp` is strongly recommended.)*
 
-## Prerequisites
+Copy `.env.example` to `.env` (or `/etc/y4music-rs/.env` for systemd deployments) and configure:
 
-* **Rust** (for building)
-* **ffmpeg**
-* **yt-dlp**
-  *(Note: If you encounter playback errors such as 403 Forbidden due to YouTube's specification changes, using the **nightly build** of `yt-dlp` is strongly recommended.)*
+| Variable | Required | Description |
+|---|---|---|
+| `DISCORD_TOKEN` | Yes | Discord bot token from the Developer Portal. |
+| `DATABASE_URL` | No | SQLite connection URL (default: `sqlite:///var/lib/y4music-rs/data.db`; `.env.example` uses `sqlite://data/y1music.db`). |
+| `TEST_GUILD_ID` | No | Guild ID for instant slash-command sync during testing. |
+| `YTDLP_EXTRA_ARGS` | No | Space-separated extra flags forwarded to `yt-dlp`. |
+
+---
 
 ## Setup & Tools
 
-We provide scripts to simplify deployment for Linux environments.
+Deployment scripts are provided for Linux environments:
 
 **1. Installation & Daemonization**
-After building, run the included setup script to automatically configure an FHS-compliant directory structure (`/etc/`, `/var/lib/`) and register the `systemd` service.
 ```bash
 cargo build --release
 sudo ./setup.sh
@@ -50,29 +82,46 @@ sudo systemctl enable --now y4music-rs
 ```
 
 **2. Guild Commands Cleanup**
-A tool to prevent duplicate command displays when migrating from a test environment (guild-specific sync) to a production environment (global sync).
+Removes duplicate guild-scoped commands when migrating from a test guild to global sync:
 ```bash
 sudo ./clear_guild_commands.sh
 ```
+
+---
 
 ## Commands
 
 | Command | Description |
 |---|---|
-| `/play`, `/playnext` | Adds a track from a URL to the queue (or interrupts as next) and plays it. |
-| `/search` | Searches YouTube by keyword and lets you select a track from a menu. |
-| `/seek` | Seeks the currently playing track to the specified seconds. |
-| `/skip`, `/stop`, `/clear` | Skips the track, stops playback entirely, or clears the upcoming queue. |
-| `/shuffle`, `/loop` | Shuffles the queue or toggles the loop mode (Off/Track/Queue). |
-| `/nowplaying` | Brings the Now Playing panel back to the bottom of the chat. |
-| `/profile <volume/eq/show>` | Sets your default volume and EQ mode (Balanced/Hi-Fi). |
-| `/playlist_*` | Manages and plays personal playlists (SQLite backend). |
-| `/serverplaylist_*` | Manages and plays server-shared playlists with permission controls. |
+| `/join`, `/leave` | Joins your current voice channel or leaves and cleans up guild state. |
+| `/play`, `/playnext` | Enqueues a track/playlist from a URL or search query (or inserts as next). |
+| `/search` | Searches YouTube by keyword and lets you pick a track from a dropdown menu. |
+| `/seek` | Seeks the current track to the specified position (in seconds). |
+| `/skip`, `/stop`, `/clear` | Skips the current track, stops playback, or clears upcoming tracks. |
+| `/shuffle`, `/loop` | Shuffles the upcoming queue tail or cycles loop mode (`Off` / `Track` / `Queue`). |
+| `/queue`, `/nowplaying` | Displays the paginated queue or reposts the Now Playing panel at the bottom. |
+| `/profile <show\|volume\|eq>` | Views or updates your default volume and EQ mode (`Balanced` / `Hi-Fi`). |
+| `/playlist_*` | Manages and plays personal playlists (`create`, `add`, `play`, `show`, `remove_track`, `move`, `rename`, `delete`). |
+| `/serverplaylist_*` | Manages and plays server-shared playlists (`create`, `add`, `play`, `show`, `remove_track`, `move`, `rename`, `delete`, `lock`, `add_user`, `remove_user`, `add_role`, `remove_role`, `transfer`). |
+
+---
+
+## Release Cadence & Versioning
+
+`y4Music-rs` follows a structured `0.N.x` → `0.(N+1).0` development cycle:
+
+* **`0.N.0`**: Official release baseline.
+* **`0.N.1` – `0.N.4`**: Feature additions and planned improvements.
+* **`0.N.5` – `0.N.8`**: Stabilization, regression fixes, and bug fixes for issues found through `.N.4` (complex items are deferred to `0.(N+1).0`).
+* **`0.N.9`**: Documentation pass and release preparation.
+* **`0.(N+1).0`**: Next official release.
+
+---
 
 ## Internals
 
-For deeper insights into the design intentions behind the code—such as how seeking is achieved with a custom audio source, or Rust-specific asynchronous design patterns (deadlock avoidance, task self-cancellation issues)—please refer to the documentation in the `doc/` directory.
+For design notes on seeking with a custom `Compose` source, player module layering, DSP filtergraphs, and Rust async lock discipline, see the [docs/](docs/00_overview.md) directory.
 
 ## License
 
-This project is licensed under the MIT License. See the `LICENSE` file for details.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
