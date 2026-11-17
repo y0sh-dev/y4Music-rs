@@ -33,6 +33,9 @@ pub struct Playlist {
     pub guild_id: Option<i64>,
     pub scope: String,
     pub locked: bool,
+    /// Upstream playlist URL this playlist mirrors, if it was created from
+    /// one. `None` until linked via an import or `/playlist_sync`.
+    pub source_url: Option<String>,
 }
 
 /// A single track stored in a playlist.
@@ -46,6 +49,9 @@ pub struct PlaylistTrack {
     pub uploader: Option<String>,
     pub duration: i64,
     pub added_order: i64,
+    /// Whether this row came from the playlist's mirrored source (and may be
+    /// removed by a sync) rather than being added explicitly by a user.
+    pub is_synced: bool,
 }
 
 /// A user or role granted write access to a locked server playlist.
