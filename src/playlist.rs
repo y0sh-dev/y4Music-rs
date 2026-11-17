@@ -2,6 +2,8 @@
 
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
+use std::collections::HashSet;
+
 use crate::Error;
 use crate::models::{Collaborator, Playlist, PlaylistTrack};
 use crate::ytdlp::{TrackInfo, TrackStream};
@@ -50,7 +52,7 @@ pub async fn find(
     let row = match scope {
         Scope::Solo => {
             sqlx::query_as::<_, Playlist>(
-                "SELECT id, name, owner_id, guild_id, scope, locked FROM playlists \
+                "SELECT id, name, owner_id, guild_id, scope, locked, source_url FROM playlists \
              WHERE scope = 'solo' AND owner_id = ? AND name = ?",
             )
             .bind(lookup_id)
@@ -60,7 +62,7 @@ pub async fn find(
         }
         Scope::Server => {
             sqlx::query_as::<_, Playlist>(
-                "SELECT id, name, owner_id, guild_id, scope, locked FROM playlists \
+                "SELECT id, name, owner_id, guild_id, scope, locked, source_url FROM playlists \
              WHERE scope = 'server' AND guild_id = ? AND name = ?",
             )
             .bind(lookup_id)
@@ -77,7 +79,7 @@ pub async fn list(db: &SqlitePool, scope: Scope, lookup_id: i64) -> Result<Vec<P
     let rows = match scope {
         Scope::Solo => {
             sqlx::query_as::<_, Playlist>(
-                "SELECT id, name, owner_id, guild_id, scope, locked FROM playlists \
+                "SELECT id, name, owner_id, guild_id, scope, locked, source_url FROM playlists \
              WHERE scope = 'solo' AND owner_id = ? ORDER BY name",
             )
             .bind(lookup_id)
@@ -86,7 +88,7 @@ pub async fn list(db: &SqlitePool, scope: Scope, lookup_id: i64) -> Result<Vec<P
         }
         Scope::Server => {
             sqlx::query_as::<_, Playlist>(
-                "SELECT id, name, owner_id, guild_id, scope, locked FROM playlists \
+                "SELECT id, name, owner_id, guild_id, scope, locked, source_url FROM playlists \
              WHERE scope = 'server' AND guild_id = ? ORDER BY name",
             )
             .bind(lookup_id)
@@ -164,7 +166,7 @@ pub async fn rename(db: &SqlitePool, playlist_id: i64, new_name: &str) -> Result
 /// All tracks in a playlist, in playback/display order.
 pub async fn tracks(db: &SqlitePool, playlist_id: i64) -> Result<Vec<PlaylistTrack>, Error> {
     Ok(sqlx::query_as::<_, PlaylistTrack>(
-        "SELECT id, playlist_id, url, title, uploader, duration, added_order \
+        "SELECT id, playlist_id, url, title, uploader, duration, added_order, is_synced \
          FROM playlist_tracks WHERE playlist_id = ? ORDER BY added_order",
     )
     .bind(playlist_id)
@@ -179,6 +181,67 @@ pub struct ImportResult {
     /// Whether the source had more tracks than `MAX_BULK_ADD` that were
     /// left unread once the cap was hit.
     pub truncated: bool,
+}
+
+/// Outcome of a differential sync (`sync_tracks_from_stream`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncResult {
+    /// Upstream tracks newly inserted as synced.
+    pub added: usize,
+    /// Stale synced rows removed because they are no longer upstream.
+    pub removed: usize,
+    /// Explicit (`is_synced = 0`) rows left untouched by the sync.
+    pub preserved_explicit: usize,
+    /// Whether the upstream listing was cut off at `MAX_BULK_ADD`.
+    pub truncated: bool,
+}
+
+/// Heuristic for "this import targets a whole external playlist rather than
+/// a single video or a search term".
+///
+/// Only `http(s)` URLs qualify, so a plain search phrase can never be
+/// mistaken for a playlist. Recognised shapes cover YouTube (`list=`),
+/// Spotify/YouTube-style `/playlist/` paths, SoundCloud `/sets/`, and
+/// album-style `/album/` paths. A single-video URL carries none of these
+/// markers and stays explicit.
+pub fn is_playlist_url(query: &str) -> bool {
+    let trimmed = query.trim();
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.contains("list=")
+        || lower.contains("/playlist/")
+        || lower.contains("/playlist?")
+        || lower.contains("/sets/")
+        || lower.contains("/album/")
+}
+
+/// Comparison key for upstream source URLs: trimmed, with a single trailing
+/// slash removed so `.../playlist?list=X` and `.../playlist?list=X/` compare
+/// equal. Anything beyond that stays exact -- rewriting query parameters
+/// risks conflating genuinely different playlists.
+fn normalize_source_url(url: &str) -> &str {
+    url.trim().trim_end_matches('/')
+}
+
+/// Whether two upstream playlist URLs identify the same source.
+pub fn same_source_url(a: &str, b: &str) -> bool {
+    normalize_source_url(a) == normalize_source_url(b)
+}
+
+/// Records (or clears) the upstream URL a playlist mirrors.
+pub async fn set_source_url(
+    db: &SqlitePool,
+    playlist_id: i64,
+    source_url: Option<&str>,
+) -> Result<(), Error> {
+    sqlx::query("UPDATE playlists SET source_url = ? WHERE id = ?")
+        .bind(source_url)
+        .bind(playlist_id)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 /// Drains `stream` into `playlist_id`, in two phases kept strictly
@@ -197,34 +260,39 @@ pub struct ImportResult {
 /// tens-of-seconds) network-bound import and starved other guilds'
 /// unrelated DB operations with `SQLITE_BUSY`.
 ///
+/// `is_synced` marks the inserted rows as belonging to the playlist's
+/// mirrored source (so a later sync may delete them). Synced imports skip
+/// URLs already present in the playlist, avoiding a duplicate when the
+/// user had already added the same track explicitly.
+///
 /// Does not itself check permissions -- callers check `has_permission`
 /// first.
 pub async fn import_tracks_from_stream(
     db: &SqlitePool,
     playlist_id: i64,
     stream: &mut TrackStream,
+    is_synced: bool,
 ) -> Result<ImportResult, Error> {
     // Receive phase -- network-bound, no DB lock held.
-    let mut buffer: Vec<TrackInfo> = Vec::new();
-    let mut truncated = false;
-    loop {
-        if buffer.len() >= MAX_BULK_ADD {
-            // Peek one more to tell "stream ended right at the cap" apart
-            // from "there was more we chose not to read".
-            truncated = stream.next_track().await?.is_some();
-            break;
-        }
-        match stream.next_track().await? {
-            Some(track) => buffer.push(track),
-            None => break,
-        }
+    let mut received = receive_tracks(stream).await?;
+
+    if is_synced {
+        let existing: Vec<String> =
+            sqlx::query_scalar("SELECT url FROM playlist_tracks WHERE playlist_id = ?")
+                .bind(playlist_id)
+                .fetch_all(db)
+                .await?;
+        let mut present: HashSet<String> = existing.into_iter().collect();
+        received
+            .tracks
+            .retain(|track| present.insert(track.webpage_url.clone()));
     }
 
-    let imported = buffer.len();
+    let imported = received.tracks.len();
     if imported == 0 {
         return Ok(ImportResult {
             imported: 0,
-            truncated,
+            truncated: received.truncated,
         });
     }
 
@@ -237,14 +305,171 @@ pub async fn import_tracks_from_stream(
     .fetch_one(&mut *tx)
     .await?;
 
-    for chunk in buffer.chunks(IMPORT_CHUNK_SIZE) {
-        insert_chunk(&mut tx, playlist_id, chunk, next_order).await?;
+    for chunk in received.tracks.chunks(IMPORT_CHUNK_SIZE) {
+        insert_chunk(&mut tx, playlist_id, chunk, next_order, is_synced).await?;
         next_order += chunk.len() as i64;
     }
 
     tx.commit().await?;
     Ok(ImportResult {
         imported,
+        truncated: received.truncated,
+    })
+}
+
+/// Tracks collected from one complete (or deliberately truncated) receive
+/// pass, before any DB write happens.
+struct ReceivedTracks {
+    tracks: Vec<TrackInfo>,
+    truncated: bool,
+}
+
+/// Receive phase shared by imports and syncs: drain the network stream up
+/// to `MAX_BULK_ADD`, without holding any DB lock.
+async fn receive_tracks(stream: &mut TrackStream) -> Result<ReceivedTracks, Error> {
+    let mut tracks: Vec<TrackInfo> = Vec::new();
+    let mut truncated = false;
+    loop {
+        if tracks.len() >= MAX_BULK_ADD {
+            // Peek one more to tell "stream ended right at the cap" apart
+            // from "there was more we chose not to read".
+            truncated = stream.next_track().await?.is_some();
+            break;
+        }
+        match stream.next_track().await? {
+            Some(track) => tracks.push(track),
+            None => break,
+        }
+    }
+    Ok(ReceivedTracks { tracks, truncated })
+}
+
+/// Differential sync: mirror `playlist_id` onto an external playlist while
+/// preserving every explicitly added track.
+///
+/// Receive and write phases stay strictly separate (see
+/// `import_tracks_from_stream`). A stream error aborts before any write, and
+/// a non-zero `yt-dlp` exit is surfaced *before* opening the transaction, so
+/// a failed or partial fetch can never wipe synced tracks. When the listing
+/// itself was truncated at `MAX_BULK_ADD`, stale synced rows are left alone
+/// too: their absence from the partial upstream view does not prove they
+/// were removed upstream.
+pub async fn sync_tracks_from_stream(
+    db: &SqlitePool,
+    playlist_id: i64,
+    mut stream: TrackStream,
+) -> Result<SyncResult, Error> {
+    let received = receive_tracks(&mut stream).await?;
+    // A fully drained stream is waited on so a non-zero `yt-dlp` exit is
+    // caught here, before the write phase. A truncated stream is abandoned
+    // instead (its `Drop` kills the child).
+    let finish = if received.truncated {
+        None
+    } else {
+        Some(stream.finish().await)
+    };
+    commit_sync(
+        db,
+        playlist_id,
+        &received.tracks,
+        received.truncated,
+        finish,
+    )
+    .await
+}
+
+/// Last line of defence for the sync pipeline: reject an incomplete fetch
+/// before touching the playlist, then apply the write phase.
+async fn commit_sync(
+    db: &SqlitePool,
+    playlist_id: i64,
+    upstream: &[TrackInfo],
+    truncated: bool,
+    finish: Option<Result<(), Error>>,
+) -> Result<SyncResult, Error> {
+    if let Some(finish) = finish {
+        finish?;
+    }
+    apply_sync(db, playlist_id, upstream, truncated).await
+}
+
+/// Write phase of a sync, in one transaction:
+///
+/// - delete `is_synced = 1` rows whose URL is absent upstream (never when
+///   `truncated`, and never `is_synced = 0` rows);
+/// - insert upstream URLs that are not already present (under either flag)
+///   as `is_synced = 1`, in upstream order, appended after the current
+///   maximum `added_order`.
+///
+/// Existing rows keep their `added_order` (explicit tracks are therefore
+/// untouched, including their position); only newly inserted tracks get
+/// sequential orders. Upstream duplicates collapse to their first
+/// occurrence.
+async fn apply_sync(
+    db: &SqlitePool,
+    playlist_id: i64,
+    upstream: &[TrackInfo],
+    truncated: bool,
+) -> Result<SyncResult, Error> {
+    let mut seen = HashSet::new();
+    let upstream_unique: Vec<&TrackInfo> = upstream
+        .iter()
+        .filter(|track| seen.insert(track.webpage_url.as_str()))
+        .collect();
+
+    let mut tx = db.begin().await?;
+    let existing: Vec<(i64, String, bool)> = sqlx::query_as(
+        "SELECT id, url, is_synced FROM playlist_tracks WHERE playlist_id = ? ORDER BY added_order",
+    )
+    .bind(playlist_id)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut removed = 0_usize;
+    if !truncated {
+        let upstream_urls: HashSet<&str> = upstream_unique
+            .iter()
+            .map(|track| track.webpage_url.as_str())
+            .collect();
+        for (id, url, is_synced) in &existing {
+            if *is_synced && !upstream_urls.contains(url.as_str()) {
+                sqlx::query("DELETE FROM playlist_tracks WHERE id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                removed += 1;
+            }
+        }
+    }
+
+    let preserved_explicit = existing.iter().filter(|(_, _, synced)| !*synced).count();
+    let mut present: HashSet<String> = existing.into_iter().map(|(_, url, _)| url).collect();
+    let to_insert: Vec<TrackInfo> = upstream_unique
+        .into_iter()
+        .filter(|track| present.insert(track.webpage_url.clone()))
+        .cloned()
+        .collect();
+    let added = to_insert.len();
+
+    if added > 0 {
+        let mut next_order: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(added_order) + 1, 0) FROM playlist_tracks WHERE playlist_id = ?",
+        )
+        .bind(playlist_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        for chunk in to_insert.chunks(IMPORT_CHUNK_SIZE) {
+            insert_chunk(&mut tx, playlist_id, chunk, next_order, true).await?;
+            next_order += chunk.len() as i64;
+        }
+    }
+
+    tx.commit().await?;
+    Ok(SyncResult {
+        added,
+        removed,
+        preserved_explicit,
         truncated,
     })
 }
@@ -256,9 +481,10 @@ async fn insert_chunk(
     playlist_id: i64,
     chunk: &[TrackInfo],
     start_order: i64,
+    is_synced: bool,
 ) -> Result<(), Error> {
     let mut builder = sqlx::QueryBuilder::new(
-        "INSERT INTO playlist_tracks (playlist_id, url, title, uploader, duration, added_order) ",
+        "INSERT INTO playlist_tracks (playlist_id, url, title, uploader, duration, added_order, is_synced) ",
     );
     builder.push_values(chunk.iter().enumerate(), |mut row, (i, track)| {
         row.push_bind(playlist_id)
@@ -266,7 +492,8 @@ async fn insert_chunk(
             .push_bind(&track.title)
             .push_bind(&track.uploader)
             .push_bind(track.duration)
-            .push_bind(start_order + i as i64);
+            .push_bind(start_order + i as i64)
+            .push_bind(is_synced);
     });
     builder.build().execute(&mut **tx).await?;
     Ok(())
@@ -286,7 +513,7 @@ pub async fn remove_track(
     let mut tx = db.begin().await?;
 
     let track = sqlx::query_as::<_, PlaylistTrack>(
-        "SELECT id, playlist_id, url, title, uploader, duration, added_order \
+        "SELECT id, playlist_id, url, title, uploader, duration, added_order, is_synced \
          FROM playlist_tracks WHERE playlist_id = ? ORDER BY added_order LIMIT 1 OFFSET ?",
     )
     .bind(playlist_id)
@@ -486,4 +713,172 @@ pub async fn transfer_ownership(
         .await?;
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::SqlitePool;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::{SyncResult, apply_sync, commit_sync};
+    use crate::ytdlp::TrackInfo;
+
+    async fn memory_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    async fn seed_playlist(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO playlists (name, owner_id, guild_id, scope, locked) \
+             VALUES ('test', 1, NULL, 'solo', 0) RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("insert playlist")
+    }
+
+    async fn insert_track(
+        pool: &SqlitePool,
+        playlist_id: i64,
+        url: &str,
+        order: i64,
+        synced: bool,
+    ) {
+        sqlx::query(
+            "INSERT INTO playlist_tracks \
+             (playlist_id, url, title, uploader, duration, added_order, is_synced) \
+             VALUES (?, ?, ?, NULL, 0, ?, ?)",
+        )
+        .bind(playlist_id)
+        .bind(url)
+        .bind(format!("Title {url}"))
+        .bind(order)
+        .bind(synced)
+        .execute(pool)
+        .await
+        .expect("insert track");
+    }
+
+    async fn rows(pool: &SqlitePool, playlist_id: i64) -> Vec<(String, bool)> {
+        sqlx::query_as(
+            "SELECT url, is_synced FROM playlist_tracks WHERE playlist_id = ? ORDER BY added_order",
+        )
+        .bind(playlist_id)
+        .fetch_all(pool)
+        .await
+        .expect("fetch rows")
+    }
+
+    fn track(url: &str) -> TrackInfo {
+        TrackInfo {
+            title: format!("Title {url}"),
+            uploader: None,
+            duration: 0,
+            webpage_url: url.to_string(),
+            thumbnail: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_mirrors_upstream_and_preserves_explicit_tracks() {
+        let pool = memory_pool().await;
+        let playlist_id = seed_playlist(&pool).await;
+        insert_track(&pool, playlist_id, "explicit", 0, false).await;
+        insert_track(&pool, playlist_id, "stale", 1, true).await;
+        insert_track(&pool, playlist_id, "survivor", 2, true).await;
+
+        let result = apply_sync(
+            &pool,
+            playlist_id,
+            &[track("survivor"), track("new")],
+            false,
+        )
+        .await
+        .expect("sync");
+
+        assert_eq!(
+            result,
+            SyncResult {
+                added: 1,
+                removed: 1,
+                preserved_explicit: 1,
+                truncated: false,
+            }
+        );
+        assert_eq!(
+            rows(&pool, playlist_id).await,
+            vec![
+                ("explicit".to_string(), false),
+                ("survivor".to_string(), true),
+                ("new".to_string(), true),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_does_not_duplicate_an_existing_explicit_track() {
+        let pool = memory_pool().await;
+        let playlist_id = seed_playlist(&pool).await;
+        insert_track(&pool, playlist_id, "same", 0, false).await;
+
+        let result = apply_sync(&pool, playlist_id, &[track("same")], false)
+            .await
+            .expect("sync");
+
+        assert_eq!(result.added, 0);
+        assert_eq!(result.removed, 0);
+        assert_eq!(result.preserved_explicit, 1);
+        assert_eq!(
+            rows(&pool, playlist_id).await,
+            vec![("same".to_string(), false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_sync_leaves_existing_synced_tracks_intact() {
+        let pool = memory_pool().await;
+        let playlist_id = seed_playlist(&pool).await;
+        insert_track(&pool, playlist_id, "synced", 0, true).await;
+        insert_track(&pool, playlist_id, "explicit", 1, false).await;
+        let before = rows(&pool, playlist_id).await;
+
+        let result = commit_sync(
+            &pool,
+            playlist_id,
+            &[],
+            false,
+            Some(Err("yt-dlp exited with an error".into())),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(rows(&pool, playlist_id).await, before);
+    }
+
+    #[tokio::test]
+    async fn truncated_sync_adds_without_removing_unseen_tracks() {
+        let pool = memory_pool().await;
+        let playlist_id = seed_playlist(&pool).await;
+        insert_track(&pool, playlist_id, "unseen", 0, true).await;
+
+        let result = apply_sync(&pool, playlist_id, &[track("new")], true)
+            .await
+            .expect("sync");
+
+        assert_eq!(result.added, 1);
+        assert_eq!(result.removed, 0);
+        assert_eq!(
+            rows(&pool, playlist_id).await,
+            vec![("unseen".to_string(), true), ("new".to_string(), true)]
+        );
+    }
 }

@@ -43,6 +43,26 @@ pub async fn playlist_add(
         return Ok(());
     };
 
+    // A playlist URL either links this playlist to a source (first import)
+    // or is rejected in favour of `/playlist_sync` -- bulk-adding it again
+    // would duplicate the whole source instead of mirroring it.
+    let mark_synced = playlist::is_playlist_url(&query);
+    if mark_synced && let Some(existing) = playlist.source_url.as_deref() {
+        let message = if playlist::same_source_url(existing, &query) {
+            format!(
+                "ℹ️ Playlist '{playlist_name}' already mirrors that source. \
+                 Use `/playlist_sync` to apply upstream changes."
+            )
+        } else {
+            format!(
+                "❌ Playlist '{playlist_name}' already mirrors a different source ({existing}). \
+                 Use `/playlist_sync` with the new URL to switch it."
+            )
+        };
+        ctx.say(message).await?;
+        return Ok(());
+    }
+
     let mut stream = match TrackStream::spawn(&query).await {
         Ok(s) => s,
         Err(e) => {
@@ -52,15 +72,26 @@ pub async fn playlist_add(
     };
 
     let result =
-        playlist::import_tracks_from_stream(&ctx.data().db, playlist.id, &mut stream).await?;
+        playlist::import_tracks_from_stream(&ctx.data().db, playlist.id, &mut stream, mark_synced)
+            .await?;
 
     if result.imported == 0 {
         let message = match stream.finish().await {
             Err(e) => e.to_string(),
-            Ok(()) => "❌ No addable tracks were found for that URL.".to_string(),
+            Ok(()) => {
+                if mark_synced {
+                    playlist::set_source_url(&ctx.data().db, playlist.id, Some(query.trim()))
+                        .await?;
+                }
+                "❌ No addable tracks were found for that URL.".to_string()
+            }
         };
         ctx.say(message).await?;
         return Ok(());
+    }
+
+    if mark_synced {
+        playlist::set_source_url(&ctx.data().db, playlist.id, Some(query.trim())).await?;
     }
 
     let mut message = format!(
@@ -71,6 +102,90 @@ pub async fn playlist_add(
     if result.truncated {
         message.push_str(&format!(
             "\n⚠️ This source has more than {} tracks; only the first {} were added.",
+            playlist::MAX_BULK_ADD,
+            playlist::MAX_BULK_ADD
+        ));
+    }
+    if mark_synced {
+        message.push_str("\n🔗 Linked this playlist to that source for future `/playlist_sync`.");
+    }
+    ctx.say(message).await?;
+    Ok(())
+}
+
+/// Mirrors a personal playlist onto its linked external source.
+///
+/// Preserves tracks added explicitly.
+#[poise::command(slash_command, guild_only)]
+pub async fn playlist_sync(
+    ctx: Context<'_>,
+    #[description = "The name of the playlist to sync."] name: String,
+    #[description = "Playlist URL to mirror (defaults to the linked source)."] source_url: Option<
+        String,
+    >,
+) -> Result<(), Error> {
+    ctx.defer_ephemeral().await?;
+    let user_id = ctx.author().id.get() as i64;
+
+    let Some(playlist) = playlist::find(&ctx.data().db, Scope::Solo, user_id, &name).await? else {
+        ctx.say(format!("❌ Playlist '{name}' not found.")).await?;
+        return Ok(());
+    };
+
+    let explicit_source = source_url.is_some();
+    let target = match source_url {
+        Some(url) => url,
+        None => match playlist.source_url.clone() {
+            Some(url) => url,
+            None => {
+                ctx.say(format!(
+                    "❌ Playlist '{name}' has no linked source. Provide a playlist URL."
+                ))
+                .await?;
+                return Ok(());
+            }
+        },
+    };
+
+    let stream = match TrackStream::spawn(&target).await {
+        Ok(s) => s,
+        Err(e) => {
+            ctx.say(e.to_string()).await?;
+            return Ok(());
+        }
+    };
+
+    let result = match playlist::sync_tracks_from_stream(&ctx.data().db, playlist.id, stream).await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            ctx.say(format!(
+                "❌ Sync failed; existing tracks were left unchanged: {e}"
+            ))
+            .await?;
+            return Ok(());
+        }
+    };
+
+    if explicit_source {
+        playlist::set_source_url(&ctx.data().db, playlist.id, Some(target.trim())).await?;
+    }
+
+    let mut message = format!(
+        "✅ Synced playlist '{name}': {} added, {} removed, {} explicit track{} preserved.",
+        result.added,
+        result.removed,
+        result.preserved_explicit,
+        if result.preserved_explicit == 1 {
+            ""
+        } else {
+            "s"
+        }
+    );
+    if result.truncated {
+        message.push_str(&format!(
+            "\n⚠️ This source has more than {} tracks; only the first {} were considered. \
+             Existing synced tracks were not removed from an incomplete listing.",
             playlist::MAX_BULK_ADD,
             playlist::MAX_BULK_ADD
         ));
