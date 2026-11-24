@@ -99,14 +99,21 @@ pub async fn volume(
         .execute(&ctx.data().db)
         .await?;
 
-    // Apply the new volume live to the current queue, if any.
+    // Apply the new volume live, but only to tracks this user requested: a
+    // profile change must not retune another member's queued songs.
     if let Some(guild_id) = ctx.guild_id()
         && let Some(manager) = songbird::get(ctx.serenity_context()).await
         && let Some(call) = manager.get(guild_id)
     {
         let volume = (percent as f32 / 100.0).clamp(0.0, 2.0);
-        for handle in call.lock().await.queue().current_queue() {
-            let _ = handle.set_volume(volume);
+        // Snapshot under the lock, then update outside it (no lock held while
+        // sending to each track actor).
+        let handles = call.lock().await.queue().current_queue();
+        let author_id = ctx.author().id;
+        for handle in handles {
+            if handle.data::<crate::player::TrackMeta>().requested_by == author_id {
+                let _ = handle.set_volume(volume);
+            }
         }
     }
 
