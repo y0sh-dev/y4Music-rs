@@ -227,6 +227,22 @@ async fn handle_page(
     Ok(())
 }
 
+/// Replies ephemerally when a select-menu choice no longer maps to a live
+/// search session, rather than leaving the interaction unanswered (which
+/// Discord would surface as "interaction failed").
+async fn reply_expired_selection(
+    ctx: &serenity::Context,
+    interaction: &serenity::ComponentInteraction,
+) -> Result<(), Error> {
+    let response = serenity::CreateInteractionResponseMessage::new()
+        .content("❌ This search result has expired. Please run `/search` again.")
+        .ephemeral(true);
+    interaction
+        .create_response(ctx, serenity::CreateInteractionResponse::Message(response))
+        .await?;
+    Ok(())
+}
+
 async fn handle_select(
     ctx: &serenity::Context,
     interaction: &serenity::ComponentInteraction,
@@ -237,20 +253,19 @@ async fn handle_select(
         return Ok(());
     };
     let Some(index) = values.first().and_then(|v| v.parse::<usize>().ok()) else {
+        reply_expired_selection(ctx, interaction).await?;
         return Ok(());
     };
 
-    let track = {
-        let Some(session) = data.search_sessions.get(&interaction.message.id) else {
-            interaction
-                .create_response(ctx, serenity::CreateInteractionResponse::Acknowledge)
-                .await?;
-            return Ok(());
-        };
-        let Some(track) = session.tracks.get(index) else {
-            return Ok(());
-        };
-        track.clone()
+    // Resolve the selected track while the DashMap guard is held, then drop it
+    // (end of statement) before any `.await`.
+    let track = data
+        .search_sessions
+        .get(&interaction.message.id)
+        .and_then(|session| session.tracks.get(index).cloned());
+    let Some(track) = track else {
+        reply_expired_selection(ctx, interaction).await?;
+        return Ok(());
     };
 
     let Some(guild_id) = interaction.guild_id else {
