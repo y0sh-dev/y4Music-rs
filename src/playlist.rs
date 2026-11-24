@@ -720,7 +720,8 @@ mod tests {
     use sqlx::SqlitePool;
     use sqlx::sqlite::SqlitePoolOptions;
 
-    use super::{SyncResult, apply_sync, commit_sync};
+    use super::{SyncResult, apply_sync, commit_sync, has_permission};
+    use crate::models::{Collaborator, Playlist};
     use crate::ytdlp::TrackInfo;
 
     async fn memory_pool() -> SqlitePool {
@@ -879,6 +880,47 @@ mod tests {
         assert_eq!(
             rows(&pool, playlist_id).await,
             vec![("unseen".to_string(), true), ("new".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn has_permission_accepts_owner_user_and_role_collaborators_only() {
+        let playlist = Playlist {
+            id: 1,
+            name: "shared".to_string(),
+            owner_id: 10,
+            guild_id: Some(1),
+            scope: "server".to_string(),
+            locked: true,
+            source_url: None,
+        };
+        let collaborators = vec![
+            Collaborator {
+                id: 1,
+                playlist_id: 1,
+                user_id: Some(20),
+                role_id: None,
+            },
+            Collaborator {
+                id: 2,
+                playlist_id: 1,
+                user_id: None,
+                role_id: Some(30),
+            },
+        ];
+
+        assert!(has_permission(&playlist, 10, &[], &collaborators), "owner");
+        assert!(
+            has_permission(&playlist, 20, &[], &collaborators),
+            "user collaborator"
+        );
+        assert!(
+            has_permission(&playlist, 21, &[30], &collaborators),
+            "role collaborator"
+        );
+        assert!(
+            !has_permission(&playlist, 21, &[31], &collaborators),
+            "stranger"
         );
     }
 }

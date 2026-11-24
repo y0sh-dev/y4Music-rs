@@ -85,9 +85,11 @@ async fn find_owned(
     Ok(Some(playlist))
 }
 
-/// Loads a server playlist and checks that the invoking user has
-/// `has_permission` on it (owner, a user collaborator, or a role
-/// collaborator), regardless of whether the playlist is locked.
+/// Loads a server playlist and checks that the invoking user may perform a
+/// destructive/edit operation on it: the owner, a collaborator (user or
+/// role), or a server administrator. Unlike `find_writable`, this is enforced
+/// even when the playlist is unlocked, so an unlocked shared playlist cannot
+/// be modified by an arbitrary member.
 async fn find_permitted(ctx: &Context<'_>, name: &str) -> Result<Option<Playlist>, Error> {
     let guild_id = ctx.guild_id().expect("guild_only").get() as i64;
     let Some(playlist) = playlist::find(&ctx.data().db, Scope::Server, guild_id, name).await?
@@ -99,8 +101,9 @@ async fn find_permitted(ctx: &Context<'_>, name: &str) -> Result<Option<Playlist
     let collaborators = playlist::collaborators(&ctx.data().db, playlist.id).await?;
     let roles = role_ids(ctx).await;
     let user_id = ctx.author().id.get() as i64;
-    if !playlist::has_permission(&playlist, user_id, &roles, &collaborators) {
-        ctx.say("❌ This action can only be performed by the playlist owner or a collaborator.")
+    let has_permission = playlist::has_permission(&playlist, user_id, &roles, &collaborators);
+    if !has_permission && !is_admin(ctx).await? {
+        ctx.say("❌ This action can only be performed by the playlist owner, a collaborator, or a server administrator.")
             .await?;
         return Ok(None);
     }
@@ -295,8 +298,10 @@ pub async fn serverplaylist_add(
 
 /// Mirrors a shared playlist onto its linked external source.
 ///
-/// Preserves explicitly added tracks and requires the same write permission
-/// as `serverplaylist_add`.
+/// Preserves explicitly added tracks. Because a sync can delete mirrored
+/// (`is_synced`) rows, it requires `find_permitted`'s owner / collaborator /
+/// administrator check rather than the weaker `find_writable` gate used by
+/// additive commands on unlocked playlists.
 #[poise::command(slash_command, guild_only)]
 pub async fn serverplaylist_sync(
     ctx: Context<'_>,
@@ -307,7 +312,7 @@ pub async fn serverplaylist_sync(
 ) -> Result<(), Error> {
     ctx.defer_ephemeral().await?;
 
-    let Some(playlist) = find_writable(&ctx, &name).await? else {
+    let Some(playlist) = find_permitted(&ctx, &name).await? else {
         return Ok(());
     };
 
