@@ -31,5 +31,5 @@ pub use ui::{
     control_panel_components, custom_id, disabled_control_panel_components, ensure_progress_ticker,
     finished_embed, format_duration, goodbye_embed, handle_component_interaction,
     handle_voice_state_update, now_playing_embed, progress_bar, refresh_panel,
-    sync_idle_leave_task,
+    sync_idle_leave_task, user_shares_bot_voice_channel,
 };

@@ -27,6 +27,40 @@ pub const PANEL_SEEK_STEP_SECS: i64 = 10;
 /// of clicks doesn't hammer the Discord API.
 pub const BUTTON_COOLDOWN: Duration = Duration::from_millis(1500);
 
+/// Whether `user_id` may issue playback-control actions in `guild_id`.
+///
+/// True when the bot is not currently connected to voice (each command then
+/// keeps its own "nothing is playing" / "not connected" reply), and true when
+/// the user occupies the same voice channel as the bot. Reading both voice
+/// states from the gateway-maintained cache keeps this free of network I/O and
+/// locks.
+pub fn user_shares_bot_voice_channel(
+    cache: &serenity::Cache,
+    guild_id: serenity::GuildId,
+    user_id: serenity::UserId,
+) -> bool {
+    let Some(guild) = cache.guild(guild_id) else {
+        return true;
+    };
+    let bot_channel = guild
+        .voice_states
+        .get(&cache.current_user().id)
+        .and_then(|state| state.channel_id);
+    let user_channel = guild
+        .voice_states
+        .get(&user_id)
+        .and_then(|state| state.channel_id);
+    shares_voice_channel(bot_channel, user_channel)
+}
+
+/// Pure core of [`user_shares_bot_voice_channel`], split out for unit tests.
+fn shares_voice_channel(
+    bot_channel: Option<serenity::ChannelId>,
+    user_channel: Option<serenity::ChannelId>,
+) -> bool {
+    bot_channel.is_none_or(|bot_channel| user_channel == Some(bot_channel))
+}
+
 /// Renders a `████────` -style text progress bar for `position` out of
 /// `total`. A zero (or otherwise degenerate) `total` renders an empty bar.
 pub fn progress_bar(position: Duration, total: Duration) -> String {
@@ -685,6 +719,29 @@ pub async fn handle_component_interaction(
         return Ok(());
     };
 
+    let Some(call) = songbird::get(ctx)
+        .await
+        .and_then(|manager| manager.get(guild_id))
+    else {
+        interaction
+            .create_response(ctx, serenity::CreateInteractionResponse::Acknowledge)
+            .await?;
+        return Ok(());
+    };
+
+    // Playback control is restricted to members sitting in the bot's own
+    // voice channel. Checked before the cooldown so an outsider always gets
+    // the reason instead of a silent no-op.
+    if !user_shares_bot_voice_channel(&ctx.cache, guild_id, interaction.user.id) {
+        let response = serenity::CreateInteractionResponseMessage::new()
+            .content("❌ Join the bot's voice channel to control playback.")
+            .ephemeral(true);
+        interaction
+            .create_response(ctx, serenity::CreateInteractionResponse::Message(response))
+            .await?;
+        return Ok(());
+    }
+
     // Silent per-guild cooldown: a press within `BUTTON_COOLDOWN` of the
     // last one is acknowledged and dropped, to avoid hammering the API.
     if let Some(state_arc) = guild_players.get(&guild_id).map(|entry| entry.clone()) {
@@ -706,13 +763,6 @@ pub async fn handle_component_interaction(
     interaction
         .create_response(ctx, serenity::CreateInteractionResponse::Acknowledge)
         .await?;
-
-    let Some(manager) = songbird::get(ctx).await else {
-        return Ok(());
-    };
-    let Some(call) = manager.get(guild_id) else {
-        return Ok(());
-    };
 
     // Resolved before locking `call` below, so the DashMap guard from
     // `.get()` doesn't overlap with it.
@@ -822,4 +872,30 @@ pub async fn handle_component_interaction(
     refresh_panel(&http, guild_id, guild_players, &call).await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shares_voice_channel;
+    use poise::serenity_prelude as serenity;
+
+    #[test]
+    fn voice_gate_allows_everyone_when_the_bot_is_disconnected() {
+        assert!(shares_voice_channel(None, None));
+        assert!(shares_voice_channel(
+            None,
+            Some(serenity::ChannelId::new(1))
+        ));
+    }
+
+    #[test]
+    fn voice_gate_requires_the_bots_own_channel() {
+        let bot = serenity::ChannelId::new(1);
+        assert!(shares_voice_channel(Some(bot), Some(bot)));
+        assert!(!shares_voice_channel(
+            Some(bot),
+            Some(serenity::ChannelId::new(2))
+        ));
+        assert!(!shares_voice_channel(Some(bot), None));
+    }
 }

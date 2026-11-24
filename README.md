@@ -36,11 +36,10 @@
 * **Playback & Queue Control**: URL/search playback, `/playnext` priority insertion, seeking (`/seek` & panel buttons), `Off` / `Track` / `Queue` loop modes, and queue-tail shuffle.
 * **Stateless Event-Driven UI**: Now Playing panel driven by `songbird` `Play` / `End` events with silent rate-limit cooldowns and 404-safe message tracking.
 * **Per-User Audio Profiles**: Persistent default volume (0–200%) and EQ mode (`Balanced` / `Hi-Fi` Proportional-Q + lookahead `compand` + `loudnorm`) via SQLite.
-* **Personal & Server Playlists**: Streaming playlist import via `yt-dlp`, track reordering/removal, and server-shared playlists with lock & user/role collaborator permissions.
+* **Personal & Server Playlists**: Streaming playlist import via `yt-dlp`, track reordering/removal, server-shared playlists with lock & user/role collaborator permissions, and differential mirror sync from a linked external playlist URL (preserving explicitly added tracks).
 * **Voice Lifecycle Hygiene**: Auto-leave when the voice channel becomes empty or the queue stays idle, and auto-pause/resume when all listeners are deafened.
 
 ### Planned 
-* **Playlist Differential Sync**: Incremental updates when re-importing from the same external playlist URL (avoiding duplicate entries).
 * **Post-Dependency-Trim Verification & Fixes**: Any stability or regression fixes surfaced during `0.3.x` soak testing.
 
 ---
@@ -67,6 +66,7 @@ Copy `.env.example` to `.env` (or `/etc/y4music-rs/.env` for systemd deployments
 | `DATABASE_URL` | No | SQLite connection URL (default: `sqlite:///var/lib/y4music-rs/data.db`; `.env.example` uses `sqlite://data/y1music.db`). |
 | `TEST_GUILD_ID` | No | Guild ID for instant slash-command sync during testing. |
 | `YTDLP_EXTRA_ARGS` | No | Space-separated extra flags forwarded to `yt-dlp`. |
+| `EQ_HIFI_FILTER` | No | Raw ffmpeg `-af` filtergraph overriding the built-in Hi-Fi profile. |
 
 ---
 
@@ -101,8 +101,8 @@ sudo ./clear_guild_commands.sh
 | `/shuffle`, `/loop` | Shuffles the upcoming queue tail or cycles loop mode (`Off` / `Track` / `Queue`). |
 | `/queue`, `/nowplaying` | Displays the paginated queue or reposts the Now Playing panel at the bottom. |
 | `/profile <show\|volume\|eq>` | Views or updates your default volume and EQ mode (`Balanced` / `Hi-Fi`). |
-| `/playlist_*` | Manages and plays personal playlists (`create`, `add`, `play`, `show`, `remove_track`, `move`, `rename`, `delete`). |
-| `/serverplaylist_*` | Manages and plays server-shared playlists (`create`, `add`, `play`, `show`, `remove_track`, `move`, `rename`, `delete`, `lock`, `add_user`, `remove_user`, `add_role`, `remove_role`, `transfer`). |
+| `/playlist_*` | Manages and plays personal playlists (`create`, `add`, `sync`, `play`, `show`, `remove_track`, `move`, `rename`, `delete`). |
+| `/serverplaylist_*` | Manages and plays server-shared playlists (`create`, `add`, `sync`, `play`, `show`, `remove_track`, `move`, `rename`, `delete`, `lock`, `add_user`, `remove_user`, `add_role`, `remove_role`, `transfer`). |
 
 ---
 

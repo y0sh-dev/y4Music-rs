@@ -71,6 +71,30 @@ fn user_voice_channel(ctx: &Context<'_>) -> Result<serenity::ChannelId, Error> {
         .ok_or_else(|| "You must be in a voice channel first.".into())
 }
 
+/// Rejects a playback-control command from a user who is not in the bot's
+/// voice channel, replying with an ephemeral notice. Returns `false` when the
+/// caller should stop. A no-op when the bot isn't connected, so each command
+/// keeps its own "nothing is playing" / "not connected" reply in that case.
+async fn ensure_same_voice_channel(
+    ctx: &Context<'_>,
+    guild_id: serenity::GuildId,
+) -> Result<bool, Error> {
+    if crate::player::user_shares_bot_voice_channel(
+        &ctx.serenity_context().cache,
+        guild_id,
+        ctx.author().id,
+    ) {
+        return Ok(true);
+    }
+    ctx.send(
+        poise::CreateReply::default()
+            .content("❌ Join the bot's voice channel to control playback.")
+            .ephemeral(true),
+    )
+    .await?;
+    Ok(false)
+}
+
 /// Resolves `voice_channel_id`'s own configured bitrate cap (the value
 /// shown in Discord's channel settings) -- preferring the cache, falling
 /// back to a fresh HTTP fetch on a cache miss, and finally to songbird's
@@ -310,6 +334,9 @@ pub async fn join(ctx: Context<'_>) -> Result<(), Error> {
 #[poise::command(slash_command, guild_only)]
 pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().expect("guild_only");
+    if !ensure_same_voice_channel(&ctx, guild_id).await? {
+        return Ok(());
+    }
     let manager = songbird_manager(&ctx).await?;
 
     let had_anything = crate::player::cleanup_guild(
@@ -471,6 +498,9 @@ pub async fn playnext(
 #[poise::command(slash_command, guild_only)]
 pub async fn shuffle(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().expect("guild_only");
+    if !ensure_same_voice_channel(&ctx, guild_id).await? {
+        return Ok(());
+    }
     let manager = songbird_manager(&ctx).await?;
 
     let Some(call) = manager.get(guild_id) else {
@@ -504,6 +534,9 @@ pub async fn shuffle(ctx: Context<'_>) -> Result<(), Error> {
 #[poise::command(slash_command, guild_only)]
 pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().expect("guild_only");
+    if !ensure_same_voice_channel(&ctx, guild_id).await? {
+        return Ok(());
+    }
     let manager = songbird_manager(&ctx).await?;
 
     let Some(call) = manager.get(guild_id) else {
@@ -555,6 +588,9 @@ pub async fn seek(
     #[description = "Position to seek to, in seconds"] seconds: u64,
 ) -> Result<(), Error> {
     let guild_id = ctx.guild_id().expect("guild_only");
+    if !ensure_same_voice_channel(&ctx, guild_id).await? {
+        return Ok(());
+    }
     let manager = songbird_manager(&ctx).await?;
 
     let Some(call) = manager.get(guild_id) else {
@@ -590,6 +626,9 @@ pub async fn seek(
 #[poise::command(slash_command, guild_only)]
 pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().expect("guild_only");
+    if !ensure_same_voice_channel(&ctx, guild_id).await? {
+        return Ok(());
+    }
     let manager = songbird_manager(&ctx).await?;
 
     let Some(call) = manager.get(guild_id) else {
@@ -618,6 +657,9 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
 #[poise::command(slash_command, guild_only)]
 pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().expect("guild_only");
+    if !ensure_same_voice_channel(&ctx, guild_id).await? {
+        return Ok(());
+    }
     let manager = songbird_manager(&ctx).await?;
 
     let Some(call) = manager.get(guild_id) else {
@@ -677,6 +719,9 @@ pub async fn loop_cmd(
     #[description = "Choose the loop mode."] mode: LoopModeChoice,
 ) -> Result<(), Error> {
     let guild_id = ctx.guild_id().expect("guild_only");
+    if !ensure_same_voice_channel(&ctx, guild_id).await? {
+        return Ok(());
+    }
     let mode: crate::player::LoopMode = mode.into();
 
     let Some(state_arc) = ctx

@@ -206,13 +206,31 @@ impl Xorshift64 {
     }
 }
 
+/// Resolves the absolute seek destination for a track of `duration`, clamping
+/// to `[0, duration]` when it is known. Unknown durations are rejected rather
+/// than passed through: an `-ss` beyond EOF yields no PCM at all, so the
+/// track would end immediately with no explanation.
+fn resolve_seek_target(duration: Option<Duration>, target: Duration) -> Result<Duration, String> {
+    match duration {
+        Some(duration) => Ok(target.min(duration)),
+        None => {
+            Err("Cannot seek: this track's duration is unknown (e.g. a live stream).".to_string())
+        }
+    }
+}
+
 /// Seeks the currently playing track to an absolute position, by building a
 /// new `Track` (via `FfmpegEqSource::seek_time`) and swapping it in for the
 /// current one -- songbird's native seek doesn't support custom `Compose`
 /// sources. Used by `/seek` and, via `seek_by`, the panel's ⏪/⏩ buttons.
 ///
-/// Clamped to `[0, duration]` when duration is known. Returns the actual
-/// (clamped) position on success, or a user-facing error string otherwise.
+/// Clamped to `[0, duration]`. Tracks whose duration is unknown (live
+/// streams, or sources yt-dlp reported no duration for) are rejected: seeking
+/// them could land past EOF and produce an empty PCM stream, which songbird
+/// would surface as an immediate `End` rather than a usable position.
+///
+/// Returns the actual (clamped) position on success, or a user-facing error
+/// string otherwise.
 pub async fn seek_to(
     call: &Arc<Mutex<Call>>,
     extra_args: &[String],
@@ -224,10 +242,7 @@ pub async fn seek_to(
         return Err("Nothing is playing.".to_string());
     };
     let meta = current.data::<TrackMeta>();
-    let target = match meta.duration {
-        Some(duration) => target.min(duration),
-        None => target,
-    };
+    let target = resolve_seek_target(meta.duration, target)?;
     let volume = current.get_info().await.map(|s| s.volume).unwrap_or(1.0);
 
     let source = FfmpegEqSource {
@@ -305,7 +320,26 @@ pub async fn seek_by(
 
 #[cfg(test)]
 mod tests {
-    use super::{shuffle_slice, shuffle_start_index};
+    use super::{resolve_seek_target, shuffle_slice, shuffle_start_index};
+    use std::time::Duration;
+
+    #[test]
+    fn resolve_seek_target_clamps_to_a_known_duration() {
+        let duration = Duration::from_secs(120);
+        assert_eq!(
+            resolve_seek_target(Some(duration), Duration::from_secs(30)),
+            Ok(Duration::from_secs(30))
+        );
+        assert_eq!(
+            resolve_seek_target(Some(duration), Duration::from_secs(300)),
+            Ok(duration)
+        );
+    }
+
+    #[test]
+    fn resolve_seek_target_rejects_an_unknown_duration() {
+        assert!(resolve_seek_target(None, Duration::from_secs(10)).is_err());
+    }
 
     #[test]
     fn shuffle_start_index_reserves_current_and_loop_clone() {
