@@ -15,6 +15,11 @@ const PAGE_SIZE: usize = 10;
 /// `sweep_stale` reclaims it. See that function's doc comment.
 pub const SESSION_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 
+/// Hard cap on retained paginator sessions, so repeated `/queue` /
+/// `/playlist_show` calls cannot grow the map without bound between TTL
+/// sweeps.
+pub const MAX_SESSIONS: usize = 128;
+
 /// One paginated list: pre-formatted lines (one per item) plus the embed
 /// chrome around them.
 pub struct ListSession {
@@ -117,6 +122,7 @@ pub async fn send_paginated(
         .await?;
     let message_id = reply.message().await?.id;
 
+    make_room_for_session(&ctx.data().list_sessions);
     ctx.data().list_sessions.insert(message_id, session);
     Ok(())
 }
@@ -172,5 +178,53 @@ pub fn sweep_stale(sessions: &ListSessions) {
     let removed = before - sessions.len();
     if removed > 0 {
         tracing::debug!("Swept {removed} stale pagination session(s)");
+    }
+}
+
+/// Makes room for one more session: drops stale entries first, then evicts
+/// the oldest live one while the map is at `MAX_SESSIONS`. Best-effort under
+/// concurrent inserts, which is enough to bound memory growth.
+fn make_room_for_session(sessions: &ListSessions) {
+    sweep_stale(sessions);
+    while sessions.len() >= MAX_SESSIONS {
+        let oldest = sessions
+            .iter()
+            .min_by_key(|entry| entry.value().created_at)
+            .map(|entry| *entry.key());
+        let Some(oldest) = oldest else {
+            break;
+        };
+        sessions.remove(&oldest);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ListSession, ListSessions, MAX_SESSIONS, make_room_for_session};
+    use poise::serenity_prelude as serenity;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn make_room_evicts_the_oldest_live_session_at_capacity() {
+        let sessions = ListSessions::new();
+        let base = Instant::now();
+        for i in 0..MAX_SESSIONS {
+            sessions.insert(
+                serenity::MessageId::new(i as u64 + 1),
+                ListSession {
+                    title: format!("list {i}"),
+                    color: serenity::Colour::BLUE,
+                    lines: Vec::new(),
+                    footer: String::new(),
+                    created_at: base + Duration::from_secs(i as u64),
+                },
+            );
+        }
+
+        make_room_for_session(&sessions);
+
+        assert_eq!(sessions.len(), MAX_SESSIONS - 1);
+        assert!(!sessions.contains_key(&serenity::MessageId::new(1)));
+        assert!(sessions.contains_key(&serenity::MessageId::new(2)));
     }
 }

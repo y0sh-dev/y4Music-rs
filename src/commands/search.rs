@@ -19,6 +19,10 @@ const PAGE_SIZE: usize = 10;
 /// reclaims it.
 pub const SESSION_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 
+/// Hard cap on retained in-flight sessions, so repeated searches cannot grow
+/// the map without bound between TTL sweeps.
+pub const MAX_SESSIONS: usize = 128;
+
 /// One in-flight `/search` result set, keyed by its message ID.
 pub struct SearchSession {
     pub query: String,
@@ -36,6 +40,23 @@ pub fn sweep_stale(sessions: &SearchSessions) {
     let removed = before - sessions.len();
     if removed > 0 {
         tracing::debug!("Swept {removed} stale search session(s)");
+    }
+}
+
+/// Makes room for one more session: drops stale entries first, then evicts
+/// the oldest live one while the map is at `MAX_SESSIONS`. Best-effort under
+/// concurrent inserts, which is enough to bound memory growth.
+fn make_room_for_session(sessions: &SearchSessions) {
+    sweep_stale(sessions);
+    while sessions.len() >= MAX_SESSIONS {
+        let oldest = sessions
+            .iter()
+            .min_by_key(|entry| entry.value().created_at)
+            .map(|entry| *entry.key());
+        let Some(oldest) = oldest else {
+            break;
+        };
+        sessions.remove(&oldest);
     }
 }
 
@@ -163,6 +184,7 @@ pub async fn search(
         .await?;
     let message_id = reply.message().await?.id;
 
+    make_room_for_session(&ctx.data().search_sessions);
     ctx.data().search_sessions.insert(
         message_id,
         SearchSession {
@@ -329,4 +351,33 @@ async fn handle_select(
     let _ = interaction.edit_response(ctx, edit).await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_SESSIONS, SearchSession, SearchSessions, make_room_for_session};
+    use poise::serenity_prelude as serenity;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn make_room_evicts_the_oldest_live_session_at_capacity() {
+        let sessions = SearchSessions::new();
+        let base = Instant::now();
+        for i in 0..MAX_SESSIONS {
+            sessions.insert(
+                serenity::MessageId::new(i as u64 + 1),
+                SearchSession {
+                    query: format!("query {i}"),
+                    tracks: Vec::new(),
+                    created_at: base + Duration::from_secs(i as u64),
+                },
+            );
+        }
+
+        make_room_for_session(&sessions);
+
+        assert_eq!(sessions.len(), MAX_SESSIONS - 1);
+        assert!(!sessions.contains_key(&serenity::MessageId::new(1)));
+        assert!(sessions.contains_key(&serenity::MessageId::new(2)));
+    }
 }
