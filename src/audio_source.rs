@@ -145,6 +145,71 @@ fn extract_stream_url(entry: &Value) -> Option<String> {
         .map(|(u, _)| u)
 }
 
+/// Builds the `ffmpeg` argument vector for the HTTP input -> raw PCM output
+/// pipeline. Split out from [`spawn_pipeline`] so the exact production
+/// arguments can be exercised by tests (in particular the input/output option
+/// ordering, which FFmpeg validates strictly).
+///
+/// `-thread_queue_size` is deliberately absent: it is an output-only (muxer)
+/// option in FFmpeg 9 (`ffmpeg -h full` lists it under "Advanced per-file
+/// options (output-only)"), and passing it before `-i` aborts the process with
+/// "cannot be applied to input url ... Move this option before the file it
+/// belongs to." A single audio input has no muxer thread contention to tune,
+/// so no output-side override is needed either.
+fn build_ffmpeg_args(stream_url: &str, filter: &str, seek_time: Option<Duration>) -> Vec<String> {
+    // One transport/probing profile for both EQ modes -- the previous
+    // Hi-Fi-only settings (10-16M analyze/probe, 15s rw_timeout) were
+    // tuned for robustness but delayed playback start; this profile still
+    // reconnects on TCP/TLS drops and 4xx/5xx HTTP errors, just without
+    // over-provisioning the startup probe.
+    let mut args: Vec<String> = [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_on_network_error",
+        "1",
+        "-reconnect_on_http_error",
+        "4xx,5xx",
+        "-reconnect_delay_max",
+        "5",
+        "-rw_timeout",
+        "10000000",
+        "-analyzeduration",
+        "5M",
+        "-probesize",
+        "5M",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+
+    // Input (demuxer-level) seek, placed before `-i`.
+    if let Some(d) = seek_time {
+        args.push("-ss".to_string());
+        args.push(format!("{:.3}", d.as_secs_f64()));
+    }
+
+    args.extend([
+        "-i".to_string(),
+        stream_url.to_string(),
+        "-vn".to_string(),
+        "-af".to_string(),
+        filter.to_string(),
+        "-f".to_string(),
+        "f32le".to_string(),
+        "-ar".to_string(),
+        RAW_SAMPLE_RATE.to_string(),
+        "-ac".to_string(),
+        RAW_CHANNELS.to_string(),
+        "pipe:1".to_string(),
+    ]);
+    args
+}
+
 /// Resolves the stream URL, spawns `ffmpeg` to fetch and filter it, and
 /// wraps its stdout as a raw-PCM `AudioStream`.
 async fn spawn_pipeline(
@@ -161,48 +226,8 @@ async fn spawn_pipeline(
     };
 
     let mut ffmpeg = std::process::Command::new("ffmpeg");
-    ffmpeg.args(["-hide_banner", "-loglevel", "error"]);
-    // One transport/probing profile for both EQ modes -- the previous
-    // Hi-Fi-only settings (10-16M analyze/probe, 15s rw_timeout) were
-    // tuned for robustness but delayed playback start; this profile still
-    // reconnects on TCP/TLS drops and 4xx/5xx HTTP errors, just without
-    // over-provisioning the startup probe.
-    ffmpeg.args([
-        "-reconnect",
-        "1",
-        "-reconnect_streamed",
-        "1",
-        "-reconnect_on_network_error",
-        "1",
-        "-reconnect_on_http_error",
-        "4xx,5xx",
-        "-reconnect_delay_max",
-        "5",
-        "-rw_timeout",
-        "10000000",
-        "-thread_queue_size",
-        "4096",
-        "-analyzeduration",
-        "5M",
-        "-probesize",
-        "5M",
-    ]);
-    // Input (demuxer-level) seek, placed before `-i`.
-    let seek_arg = seek_time.map(|d| format!("{:.3}", d.as_secs_f64()));
-    if let Some(seek_arg) = &seek_arg {
-        ffmpeg.args(["-ss", seek_arg]);
-    }
     ffmpeg
-        .args(["-i", &stream_url, "-vn", "-af", &filter])
-        .args([
-            "-f",
-            "f32le",
-            "-ar",
-            &RAW_SAMPLE_RATE.to_string(),
-            "-ac",
-            &RAW_CHANNELS.to_string(),
-            "pipe:1",
-        ])
+        .args(build_ffmpeg_args(&stream_url, &filter, seek_time))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -244,8 +269,153 @@ fn log_stderr_lines(label: &'static str, stderr: ChildStderr) {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_stream_url;
+    use super::{build_ffmpeg_args, extract_stream_url};
     use serde_json::json;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Returns a 16-bit stereo PCM WAV of the requested length, encoded in
+    /// memory so the test needs no fixture file.
+    fn silent_wav(duration_ms: u32) -> Vec<u8> {
+        const SAMPLE_RATE: u32 = 48_000;
+        const CHANNELS: u16 = 2;
+        const BITS: u16 = 16;
+        let frames = SAMPLE_RATE * duration_ms / 1000;
+        let data_len = frames * u32::from(CHANNELS) * u32::from(BITS / 8);
+        let byte_rate = SAMPLE_RATE * u32::from(CHANNELS) * u32::from(BITS / 8);
+        let block_align = CHANNELS * BITS / 8;
+
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&CHANNELS.to_le_bytes());
+        wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+        wav.extend_from_slice(&byte_rate.to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&BITS.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.resize(44 + data_len as usize, 0);
+        wav
+    }
+
+    /// Serves `body` over a loopback HTTP server until `stop` is set. The
+    /// returned URL is unique per test (the OS assigns a free port).
+    fn serve_wav(body: Vec<u8>) -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback listener");
+        let addr = listener.local_addr().expect("read listener address");
+        listener
+            .set_nonblocking(true)
+            .expect("set listener nonblocking");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_worker = Arc::clone(&stop);
+
+        let worker = std::thread::spawn(move || {
+            while !stop_worker.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0u8; 1024];
+                        // The request headers are irrelevant: always reply with
+                        // the complete body, which FFmpeg accepts even when it
+                        // asked for a byte range.
+                        let _ = stream.read(&mut request);
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(&body);
+                        let _ = stream.flush();
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        (format!("http://{addr}/tone.wav"), stop, worker)
+    }
+
+    #[test]
+    fn keeps_input_options_before_the_input_url() {
+        let args = build_ffmpeg_args(
+            "https://cdn.example.com/track.webm",
+            "anull",
+            Some(Duration::from_millis(1234)),
+        );
+
+        let input_at = args.iter().position(|a| a == "-i").expect("-i present");
+        assert_eq!(args[input_at + 1], "https://cdn.example.com/track.webm");
+
+        for opt in [
+            "-reconnect",
+            "-reconnect_streamed",
+            "-reconnect_on_network_error",
+            "-reconnect_on_http_error",
+            "-reconnect_delay_max",
+            "-rw_timeout",
+            "-analyzeduration",
+            "-probesize",
+            "-ss",
+        ] {
+            let at = args
+                .iter()
+                .position(|a| a == opt)
+                .unwrap_or_else(|| panic!("{opt} present"));
+            assert!(at < input_at, "{opt} must be an input option (before -i)");
+        }
+        let seek_at = args.iter().position(|a| a == "-ss").expect("-ss present");
+        assert_eq!(args[seek_at + 1], "1.234");
+
+        for opt in ["-vn", "-af", "-f", "-ar", "-ac"] {
+            let at = args
+                .iter()
+                .position(|a| a == opt)
+                .unwrap_or_else(|| panic!("{opt} present"));
+            assert!(at > input_at, "{opt} must be an output option (after -i)");
+        }
+        assert!(!args.iter().any(|a| a == "-thread_queue_size"));
+    }
+
+    #[test]
+    fn ffmpeg_decodes_an_http_input_to_raw_pcm() {
+        let (url, stop, worker) = serve_wav(silent_wav(200));
+        let filter = crate::eq::balanced_profile().render();
+
+        let output = std::process::Command::new("ffmpeg")
+            .args(build_ffmpeg_args(&url, &filter, None))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn ffmpeg")
+            .wait_with_output()
+            .expect("wait for ffmpeg");
+
+        stop.store(true, Ordering::Relaxed);
+        worker.join().expect("join HTTP server");
+
+        assert!(
+            output.status.success(),
+            "ffmpeg failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.stdout.is_empty(), "ffmpeg produced no PCM");
+        assert_eq!(
+            output.stdout.len() % 8,
+            0,
+            "f32le stereo frames are 8 bytes"
+        );
+    }
 
     #[test]
     fn prefers_the_top_level_url_field() {
