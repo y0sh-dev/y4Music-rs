@@ -571,6 +571,39 @@ pub async fn remove_track(
     Ok(track)
 }
 
+/// Renumbers `updates` (track id -> new `added_order`) in one `CASE` UPDATE.
+/// A chunk of `IMPORT_CHUNK_SIZE` rows uses three bind variables each plus the
+/// playlist id, comfortably below SQLite's parameter limit.
+async fn update_added_order_chunk(
+    tx: &mut Transaction<'_, Sqlite>,
+    playlist_id: i64,
+    updates: &[(i64, i64)],
+) -> Result<(), Error> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+
+    let mut builder = sqlx::QueryBuilder::new("UPDATE playlist_tracks SET added_order = CASE id");
+    for (id, position) in updates {
+        builder
+            .push(" WHEN ")
+            .push_bind(*id)
+            .push(" THEN ")
+            .push_bind(*position);
+    }
+    builder
+        .push(" END WHERE playlist_id = ")
+        .push_bind(playlist_id)
+        .push(" AND id IN (");
+    let mut separated = builder.separated(", ");
+    for (id, _) in updates {
+        separated.push_bind(*id);
+    }
+    separated.push_unseparated(")");
+    builder.build().execute(&mut **tx).await?;
+    Ok(())
+}
+
 /// Moves a track from one 1-based position to another, renumbering
 /// `added_order` for the whole playlist inside a transaction. Returns
 /// `false` if either index was out of range.
@@ -598,12 +631,13 @@ pub async fn move_track(
     let moved = ids.remove(from as usize);
     ids.insert(to as usize, moved);
 
-    for (position, id) in ids.iter().enumerate() {
-        sqlx::query("UPDATE playlist_tracks SET added_order = ? WHERE id = ?")
-            .bind(position as i64)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+    let updates: Vec<(i64, i64)> = ids
+        .iter()
+        .enumerate()
+        .map(|(position, id)| (*id, position as i64))
+        .collect();
+    for chunk in updates.chunks(IMPORT_CHUNK_SIZE) {
+        update_added_order_chunk(&mut tx, playlist_id, chunk).await?;
     }
 
     tx.commit().await?;
@@ -925,6 +959,39 @@ mod tests {
 
         assert_eq!(result.removed, 250);
         assert!(rows(&pool, playlist_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn move_track_renumbers_across_update_chunks() {
+        let pool = memory_pool().await;
+        let playlist_id = seed_playlist(&pool).await;
+        for i in 0..250 {
+            insert_track(&pool, playlist_id, &format!("track-{i}"), i, false).await;
+        }
+
+        assert!(move_track(&pool, playlist_id, 1, 250).await.expect("move"));
+
+        let ordered: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT url, added_order FROM playlist_tracks WHERE playlist_id = ? \
+             ORDER BY added_order",
+        )
+        .bind(playlist_id)
+        .fetch_all(&pool)
+        .await
+        .expect("ordered rows");
+
+        assert_eq!(ordered.len(), 250);
+        assert_eq!(ordered[0].0, "track-1");
+        assert_eq!(ordered[249].0, "track-0");
+        assert!(
+            ordered
+                .iter()
+                .enumerate()
+                .all(|(position, (_, order))| *order == position as i64)
+        );
+
+        assert!(!move_track(&pool, playlist_id, 0, 1).await.expect("move"));
+        assert!(!move_track(&pool, playlist_id, 1, 251).await.expect("move"));
     }
 
     #[test]
