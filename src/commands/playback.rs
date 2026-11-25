@@ -19,32 +19,35 @@ use crate::commands::profile::load_or_create_raw;
 use crate::player::{PanelUpdater, PanelUpdaterKind, TrackMeta, derive_youtube_thumbnail};
 use crate::{Context, Error};
 
-/// Looks up `user_id`'s saved default volume and converts it to the `0.0
-/// ..= 2.0` fraction `Track::volume` expects (100% == `1.0`).
-async fn resolve_saved_volume(db: &SqlitePool, user_id: serenity::UserId) -> f32 {
-    match load_or_create_raw(db, user_id.get() as i64).await {
-        Ok(profile) => (profile.default_volume as f32 / 100.0).clamp(0.0, 2.0),
-        Err(e) => {
-            tracing::warn!("Failed to load saved volume for user {user_id}, using 100%: {e}");
-            1.0
-        }
-    }
+/// A user's saved playback settings, resolved in one DB round-trip.
+struct PlaybackProfile {
+    /// `0.0 ..= 2.0` fraction `Track::volume` expects (100% == `1.0`).
+    volume: f32,
+    /// `None` = Balanced; `Some(filter)` = Hi-Fi's ffmpeg `-af` graph.
+    eq_filter: Option<String>,
 }
 
-/// Looks up `user_id`'s saved `/profile eq` mode and resolves it to the
-/// ffmpeg `-af` filtergraph to apply -- `None` for Balanced,
-/// `Some(hifi_filter)` for Hi-Fi.
-async fn resolve_eq_filter(
+/// Loads `user_id`'s volume and EQ settings together. The previous split
+/// helpers each called `load_or_create_raw`, doubling the profile lookup for
+/// every enqueued track.
+async fn resolve_playback_profile(
     db: &SqlitePool,
     user_id: serenity::UserId,
     hifi_filter: &str,
-) -> Option<String> {
+) -> PlaybackProfile {
     match load_or_create_raw(db, user_id.get() as i64).await {
-        Ok(profile) if profile.default_eq_mode == "hifi" => Some(hifi_filter.to_string()),
-        Ok(_) => None,
+        Ok(profile) => PlaybackProfile {
+            volume: (profile.default_volume as f32 / 100.0).clamp(0.0, 2.0),
+            eq_filter: (profile.default_eq_mode == "hifi").then(|| hifi_filter.to_string()),
+        },
         Err(e) => {
-            tracing::warn!("Failed to load saved EQ mode for user {user_id}, using Balanced: {e}");
-            None
+            tracing::warn!(
+                "Failed to load saved profile for user {user_id}, using Balanced at 100%: {e}"
+            );
+            PlaybackProfile {
+                volume: 1.0,
+                eq_filter: None,
+            }
         }
     }
 }
@@ -247,12 +250,11 @@ pub(crate) async fn enqueue_known_raw(
     requester_name: String,
     uploader: Option<String>,
 ) -> Result<(), Error> {
-    let volume = resolve_saved_volume(db, requested_by).await;
-    let eq_filter = resolve_eq_filter(db, requested_by, eq_hifi_filter).await;
+    let profile = resolve_playback_profile(db, requested_by, eq_hifi_filter).await;
     let source = FfmpegEqSource {
         url: url.to_string(),
         ytdlp_extra_args: extra_args.to_vec(),
-        eq_filter: eq_filter.clone(),
+        eq_filter: profile.eq_filter.clone(),
         seek_time: None,
     };
     let meta = Arc::new(TrackMeta {
@@ -260,7 +262,7 @@ pub(crate) async fn enqueue_known_raw(
         url: url.to_string(),
         requested_by,
         duration: (duration_secs > 0).then(|| Duration::from_secs(duration_secs as u64)),
-        eq_filter,
+        eq_filter: profile.eq_filter,
         thumbnail: derive_youtube_thumbnail(url),
         uploader,
         requester_name,
@@ -268,7 +270,7 @@ pub(crate) async fn enqueue_known_raw(
         is_seek: false,
         is_loop_clone: false,
     });
-    let track = Track::new_with_data(source.into(), meta).volume(volume);
+    let track = Track::new_with_data(source.into(), meta).volume(profile.volume);
     call.lock().await.enqueue(track).await;
     Ok(())
 }
@@ -286,8 +288,7 @@ pub(crate) async fn enqueue_multiple_known(
     requested_by: serenity::UserId,
 ) -> Result<(), Error> {
     let db = &ctx.data().db;
-    let volume = resolve_saved_volume(db, requested_by).await;
-    let eq_filter = resolve_eq_filter(db, requested_by, &ctx.data().eq_hifi_filter).await;
+    let profile = resolve_playback_profile(db, requested_by, &ctx.data().eq_hifi_filter).await;
     let extra_args = &ctx.data().ytdlp_extra_args;
     let requester_name = ctx.author().display_name().to_string();
 
@@ -296,7 +297,7 @@ pub(crate) async fn enqueue_multiple_known(
         let source = FfmpegEqSource {
             url: track.url.clone(),
             ytdlp_extra_args: extra_args.clone(),
-            eq_filter: eq_filter.clone(),
+            eq_filter: profile.eq_filter.clone(),
             seek_time: None,
         };
         let meta = Arc::new(TrackMeta {
@@ -304,7 +305,7 @@ pub(crate) async fn enqueue_multiple_known(
             url: track.url.clone(),
             requested_by,
             duration: (track.duration > 0).then(|| Duration::from_secs(track.duration as u64)),
-            eq_filter: eq_filter.clone(),
+            eq_filter: profile.eq_filter.clone(),
             thumbnail: derive_youtube_thumbnail(&track.url),
             uploader: track.uploader.clone(),
             requester_name: requester_name.clone(),
@@ -312,7 +313,7 @@ pub(crate) async fn enqueue_multiple_known(
             is_seek: false,
             is_loop_clone: false,
         });
-        let built = Track::new_with_data(source.into(), meta).volume(volume);
+        let built = Track::new_with_data(source.into(), meta).volume(profile.volume);
         call.enqueue(built).await;
     }
     Ok(())
@@ -380,13 +381,12 @@ async fn resolve_and_build_track(ctx: &Context<'_>, url: &str) -> Result<(Track,
         .as_ref()
         .and_then(|meta| meta.channel.clone().or_else(|| meta.artist.clone()));
 
-    let volume = resolve_saved_volume(&ctx.data().db, ctx.author().id).await;
-    let eq_filter =
-        resolve_eq_filter(&ctx.data().db, ctx.author().id, &ctx.data().eq_hifi_filter).await;
+    let profile =
+        resolve_playback_profile(&ctx.data().db, ctx.author().id, &ctx.data().eq_hifi_filter).await;
     let source = FfmpegEqSource {
         url: url.to_string(),
         ytdlp_extra_args: ctx.data().ytdlp_extra_args.clone(),
-        eq_filter: eq_filter.clone(),
+        eq_filter: profile.eq_filter.clone(),
         seek_time: None,
     };
     let meta = Arc::new(TrackMeta {
@@ -394,7 +394,7 @@ async fn resolve_and_build_track(ctx: &Context<'_>, url: &str) -> Result<(Track,
         url: url.to_string(),
         requested_by: ctx.author().id,
         duration,
-        eq_filter,
+        eq_filter: profile.eq_filter,
         thumbnail,
         uploader,
         requester_name: ctx.author().display_name().to_string(),
@@ -402,7 +402,7 @@ async fn resolve_and_build_track(ctx: &Context<'_>, url: &str) -> Result<(Track,
         is_seek: false,
         is_loop_clone: false,
     });
-    let track = Track::new_with_data(source.into(), meta).volume(volume);
+    let track = Track::new_with_data(source.into(), meta).volume(profile.volume);
     Ok((track, title))
 }
 

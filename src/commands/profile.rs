@@ -20,13 +20,26 @@ pub async fn profile(_ctx: Context<'_>) -> Result<(), Error> {
 
 /// Loads a user's profile from the DB, inserting the default row on first
 /// use. Raw-parameter version so callers without a poise `Context` can use
-/// it. The insert-then-select is a single atomic upsert (`ON CONFLICT ...
-/// DO NOTHING`), so two concurrent first-time calls for the same user can't
-/// race each other into a unique-constraint violation.
+/// it.
+///
+/// SELECT-first keeps the common (already-registered) path to one query; a
+/// miss falls back to an atomic `INSERT ... ON CONFLICT DO NOTHING` plus a
+/// re-SELECT, so two concurrent first-time calls cannot race into a
+/// unique-constraint violation.
 pub(crate) async fn load_or_create_raw(
     db: &SqlitePool,
     user_id: i64,
 ) -> Result<UserProfile, Error> {
+    if let Some(profile) = sqlx::query_as::<_, UserProfile>(
+        "SELECT user_id, default_volume, default_eq_mode FROM users WHERE user_id = ?",
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?
+    {
+        return Ok(profile);
+    }
+
     let defaults = UserProfile::default_for(user_id);
     sqlx::query(
         "INSERT INTO users (user_id, default_volume, default_eq_mode) VALUES (?, ?, ?) \
@@ -180,5 +193,42 @@ impl EqMode {
             EqMode::Balanced => "🎵 Balanced",
             EqMode::Hifi => "🎧 High quality (Hi-Fi)",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_or_create_raw;
+    use sqlx::SqlitePool;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn memory_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    #[tokio::test]
+    async fn creates_defaults_once_and_returns_existing_values_later() {
+        let pool = memory_pool().await;
+
+        let created = load_or_create_raw(&pool, 42).await.expect("create");
+        assert_eq!(created.default_volume, 100);
+        assert_eq!(created.default_eq_mode, "balanced");
+
+        sqlx::query("UPDATE users SET default_volume = 150 WHERE user_id = 42")
+            .execute(&pool)
+            .await
+            .expect("update volume");
+
+        let loaded = load_or_create_raw(&pool, 42).await.expect("load");
+        assert_eq!(loaded.default_volume, 150);
     }
 }
