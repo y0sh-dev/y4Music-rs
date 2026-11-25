@@ -122,6 +122,8 @@ sudo ./clear_guild_commands.sh
 
 For design notes on seeking with a custom `Compose` source, player module layering, DSP filtergraphs, and Rust async lock discipline, see the [docs/](docs/00_overview.md) directory.
 
+> **A note on audio quality & the Opus ceiling**: Discord voice channels re-encode all audio in real time at 64–96 kbps Opus (128 kbps at higher boost tiers). Rather than masking that loss with heavy DSP, `Hi-Fi` intentionally steps out of the way—see the [epilogue in docs/05_eq_and_extending.md](docs/05_eq_and_extending.md#epilogue-hitting-the-discord-opus-wall).
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
