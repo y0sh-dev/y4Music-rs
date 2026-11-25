@@ -306,7 +306,7 @@ pub async fn import_tracks_from_stream(
     .await?;
 
     for chunk in received.tracks.chunks(IMPORT_CHUNK_SIZE) {
-        insert_chunk(&mut tx, playlist_id, chunk, next_order, is_synced).await?;
+        insert_chunk(&mut tx, playlist_id, chunk.iter(), next_order, is_synced).await?;
         next_order += chunk.len() as i64;
     }
 
@@ -425,29 +425,29 @@ async fn apply_sync(
     .fetch_all(&mut *tx)
     .await?;
 
-    let mut removed = 0_usize;
-    if !truncated {
+    let stale_ids: Vec<i64> = if truncated {
+        Vec::new()
+    } else {
         let upstream_urls: HashSet<&str> = upstream_unique
             .iter()
             .map(|track| track.webpage_url.as_str())
             .collect();
-        for (id, url, is_synced) in &existing {
-            if *is_synced && !upstream_urls.contains(url.as_str()) {
-                sqlx::query("DELETE FROM playlist_tracks WHERE id = ?")
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?;
-                removed += 1;
-            }
-        }
-    }
+        existing
+            .iter()
+            .filter(|(_, url, is_synced)| *is_synced && !upstream_urls.contains(url.as_str()))
+            .map(|(id, _, _)| *id)
+            .collect()
+    };
+    let removed = stale_ids.len();
+    delete_tracks_by_id(&mut tx, &stale_ids).await?;
 
     let preserved_explicit = existing.iter().filter(|(_, _, synced)| !*synced).count();
-    let mut present: HashSet<String> = existing.into_iter().map(|(_, url, _)| url).collect();
-    let to_insert: Vec<TrackInfo> = upstream_unique
+    // Borrow URLs from `existing` and upstream entries instead of cloning every
+    // `TrackInfo` (title/uploader/URL Strings) into `to_insert`.
+    let mut present: HashSet<&str> = existing.iter().map(|(_, url, _)| url.as_str()).collect();
+    let to_insert: Vec<&TrackInfo> = upstream_unique
         .into_iter()
-        .filter(|track| present.insert(track.webpage_url.clone()))
-        .cloned()
+        .filter(|track| present.insert(track.webpage_url.as_str()))
         .collect();
     let added = to_insert.len();
 
@@ -460,7 +460,14 @@ async fn apply_sync(
         .await?;
 
         for chunk in to_insert.chunks(IMPORT_CHUNK_SIZE) {
-            insert_chunk(&mut tx, playlist_id, chunk, next_order, true).await?;
+            insert_chunk(
+                &mut tx,
+                playlist_id,
+                chunk.iter().copied(),
+                next_order,
+                true,
+            )
+            .await?;
             next_order += chunk.len() as i64;
         }
     }
@@ -474,19 +481,40 @@ async fn apply_sync(
     })
 }
 
+/// Deletes `ids` in bounded chunks, one `DELETE ... IN (...)` per chunk. SQLite
+/// builds commonly cap bind variables far above `IMPORT_CHUNK_SIZE` (100), so
+/// this stays clear of the limit on both old and new versions.
+async fn delete_tracks_by_id(tx: &mut Transaction<'_, Sqlite>, ids: &[i64]) -> Result<(), Error> {
+    for chunk in ids.chunks(IMPORT_CHUNK_SIZE) {
+        let mut builder = sqlx::QueryBuilder::new("DELETE FROM playlist_tracks WHERE id IN (");
+        let mut separated = builder.separated(", ");
+        for id in chunk {
+            separated.push_bind(*id);
+        }
+        separated.push_unseparated(")");
+        builder.build().execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
 /// Bulk-inserts one chunk of tracks via `QueryBuilder`, `added_order`
-/// starting at `start_order`.
-async fn insert_chunk(
+/// starting at `start_order`. Borrows each `TrackInfo` so both the plain
+/// import path (`&[TrackInfo]`) and the sync path (`&[&TrackInfo]`) can share
+/// it without cloning metadata.
+async fn insert_chunk<'a, I>(
     tx: &mut Transaction<'_, Sqlite>,
     playlist_id: i64,
-    chunk: &[TrackInfo],
+    chunk: I,
     start_order: i64,
     is_synced: bool,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    I: IntoIterator<Item = &'a TrackInfo>,
+{
     let mut builder = sqlx::QueryBuilder::new(
         "INSERT INTO playlist_tracks (playlist_id, url, title, uploader, duration, added_order, is_synced) ",
     );
-    builder.push_values(chunk.iter().enumerate(), |mut row, (i, track)| {
+    builder.push_values(chunk.into_iter().enumerate(), |mut row, (i, track)| {
         row.push_bind(playlist_id)
             .push_bind(&track.webpage_url)
             .push_bind(&track.title)
@@ -881,6 +909,22 @@ mod tests {
             rows(&pool, playlist_id).await,
             vec![("unseen".to_string(), true), ("new".to_string(), true)]
         );
+    }
+
+    #[tokio::test]
+    async fn sync_deletes_stale_rows_across_delete_chunks() {
+        let pool = memory_pool().await;
+        let playlist_id = seed_playlist(&pool).await;
+        for i in 0..250 {
+            insert_track(&pool, playlist_id, &format!("stale-{i}"), i, true).await;
+        }
+
+        let result = apply_sync(&pool, playlist_id, &[], false)
+            .await
+            .expect("sync");
+
+        assert_eq!(result.removed, 250);
+        assert!(rows(&pool, playlist_id).await.is_empty());
     }
 
     #[test]
