@@ -9,6 +9,8 @@ use dashmap::DashMap;
 use poise::serenity_prelude as serenity;
 use tokio::sync::Mutex;
 
+use crate::audio_source::ResolvedStreamUrl;
+
 /// Metadata attached to every enqueued track via `Track::new_with_data`, so
 /// the queue and panel can display it without re-querying yt-dlp.
 #[derive(Debug, Clone)]
@@ -20,6 +22,10 @@ pub struct TrackMeta {
     /// This track's resolved EQ filter (`None` = Balanced, `Some` = Hi-Fi's
     /// `-af` string), snapshotted at enqueue time.
     pub eq_filter: Option<String>,
+    /// Direct CDN URL resolved for this track, if `/play` already obtained it
+    /// from the same `yt-dlp -j` lookup as the metadata. Reused by playback,
+    /// seek and loop clones until [`crate::audio_source::STREAM_URL_TTL`].
+    pub resolved_stream: Option<ResolvedStreamUrl>,
     /// Best-effort thumbnail URL, if derivable. See `derive_youtube_thumbnail`.
     pub thumbnail: Option<String>,
     /// Uploader/channel name, if known; shown as "By: {uploader}" on the panel.
