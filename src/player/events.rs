@@ -90,25 +90,48 @@ impl SongbirdEventHandler for PlaybackErrorNotifier {
             .map(|entry| entry.clone())?;
         let channel_id = state_arc.lock().await.text_channel?;
 
+        // Collect first, then send at most one message for the whole event
+        // (previously every errored track produced its own Discord call).
+        let mut failed: Vec<Arc<TrackMeta>> = Vec::new();
         for (state, handle) in *track_ctx {
-            let title = &handle.data::<TrackMeta>().title;
+            let meta = handle.data::<TrackMeta>();
             let detail = match &state.playing {
                 PlayMode::Errored(e) => e.to_string(),
                 other => format!("{other:?}"),
             };
             tracing::warn!(
-                "Playback error for '{title}' in guild {}: {detail}",
+                "Playback error for '{}' in guild {}: {detail}",
+                meta.title,
                 self.guild_id
             );
-            let _ = channel_id
-                .say(
-                    &self.http,
-                    format!("❌ Playback error: Skipping **{title}**."),
-                )
-                .await;
+            failed.push(meta);
         }
+        if failed.is_empty() {
+            return None;
+        }
+        let titles: Vec<&str> = failed.iter().map(|meta| meta.title.as_str()).collect();
+        let _ = channel_id
+            .say(&self.http, playback_error_message(&titles))
+            .await;
 
         None
+    }
+}
+
+/// Builds the user-facing error notice for one `TrackEvent::Error` event,
+/// aggregating multiple failed tracks into a single message.
+fn playback_error_message(titles: &[&str]) -> String {
+    match titles {
+        [] => String::new(),
+        [title] => format!("❌ Playback error: Skipping **{title}**."),
+        _ => {
+            let list = titles
+                .iter()
+                .map(|title| format!("**{title}**"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("❌ Playback errors: Skipping {list}.")
+        }
     }
 }
 
@@ -229,5 +252,23 @@ impl SongbirdEventHandler for LoopHandler {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::playback_error_message;
+
+    #[test]
+    fn playback_error_message_handles_zero_one_and_many_tracks() {
+        assert_eq!(playback_error_message(&[]), "");
+        assert_eq!(
+            playback_error_message(&["Song A"]),
+            "❌ Playback error: Skipping **Song A**."
+        );
+        assert_eq!(
+            playback_error_message(&["Song A", "Song B"]),
+            "❌ Playback errors: Skipping **Song A**, **Song B**."
+        );
     }
 }
