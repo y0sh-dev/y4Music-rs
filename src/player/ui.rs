@@ -295,16 +295,25 @@ pub async fn refresh_panel(
         (channel_id, state.now_playing_message, state.loop_mode)
     };
 
-    // ② `call`/queue snapshot.
-    let snapshot = call.lock().await.queue().current_queue();
-    let current = snapshot.first();
-    let next_title = snapshot
-        .get(1)
-        .map(|handle| handle.data::<TrackMeta>().title.clone());
+    // ② `call`/queue snapshot. Peek only the first two entries under a single
+    // `modify_queue` call instead of cloning the whole queue with
+    // `current_queue()` -- this runs on every panel event and progress tick.
+    let (current, next_title, queue_total) = {
+        let call = call.lock().await;
+        call.queue().modify_queue(|tracks| {
+            (
+                tracks.front().map(|queued| queued.handle()),
+                tracks
+                    .get(1)
+                    .map(|queued| queued.data::<TrackMeta>().title.clone()),
+                tracks.len(),
+            )
+        })
+    };
     // No play history is tracked, so the current track is always shown as
     // position 1 of the queue's remaining length.
     let queue_position = 1usize;
-    let queue_total = snapshot.len().max(1);
+    let queue_total = queue_total.max(1);
 
     // ③ Build with no locks held, then call Discord.
     let (embed, components) = match current {
@@ -434,16 +443,22 @@ pub async fn sync_idle_leave_task(
         return;
     };
     let mut state = state_arc.lock().await;
+    let timer_running = state
+        .idle_leave_task
+        .as_ref()
+        .is_some_and(|task| !task.is_finished());
 
+    // Fast path for the common track-to-track transition: something is
+    // playing and no idle countdown is pending, so there is nothing to
+    // cancel or start.
+    if !is_idle && !timer_running {
+        return;
+    }
     if !is_idle {
         stop_idle_leave_task(&mut state);
         return;
     }
-    if state
-        .idle_leave_task
-        .as_ref()
-        .is_some_and(|t| !t.is_finished())
-    {
+    if timer_running {
         return;
     }
     tracing::info!(
@@ -494,12 +509,44 @@ pub async fn ensure_progress_ticker(
         loop {
             interval.tick().await;
             refresh_panel(&http, guild_id, &guild_players, &call).await;
-            let still_playing = call.lock().await.queue().current().is_some();
-            if !still_playing {
+            // Stop after the track ends, errors, or the user pauses: a paused
+            // panel has no progress to advance, so further edits would only
+            // burn Discord API budget. Resume re-spawns this ticker.
+            let current = { call.lock().await.queue().current() };
+            let still_advancing = match current {
+                Some(handle) => matches!(
+                    handle.get_info().await.map(|state| state.playing),
+                    Ok(PlayMode::Play)
+                ),
+                None => false,
+            };
+            if !still_advancing {
                 break;
             }
         }
     }));
+}
+
+/// Folds voice states into `(human_count, all_deafened)` for the bot's own
+/// channel, skipping the bot and any other bots. A plain iterator pass avoids
+/// the temporary `Vec<bool>` and second cache lookup the old implementation
+/// used on every voice-state event.
+fn summarize_listeners(
+    states: impl Iterator<Item = (serenity::UserId, Option<serenity::ChannelId>, bool, bool)>,
+    bot_id: serenity::UserId,
+    bot_channel_id: serenity::ChannelId,
+) -> (usize, bool) {
+    let (count, all_deaf) = states.fold(
+        (0usize, true),
+        |(count, all), (user, channel, is_bot, deaf)| {
+            if user != bot_id && channel == Some(bot_channel_id) && !is_bot {
+                (count + 1, all && deaf)
+            } else {
+                (count, all)
+            }
+        },
+    );
+    (count, count > 0 && all_deaf)
 }
 
 /// Reacts to a human joining/leaving the bot's voice channel (auto-leave
@@ -536,38 +583,39 @@ pub async fn handle_voice_state_update(
         );
         return Ok(());
     }
-    let Some(bot_channel_id) = ctx
-        .cache
-        .guild(guild_id)
-        .and_then(|guild| guild.voice_states.get(&bot_id)?.channel_id)
-    else {
-        tracing::warn!(
-            "handle_voice_state_update: guild {guild_id}'s cache has no voice state for the bot itself, even though songbird reports an active call -- skipping this event (auto-leave/auto-pause logic won't run)."
+    let (bot_channel_id, human_count, all_deafened) = {
+        // One cache lookup supplies both the bot's own channel and every voice
+        // state; the guard is released before any later `.await`.
+        let Some(guild) = ctx.cache.guild(guild_id) else {
+            tracing::warn!(
+                "handle_voice_state_update: guild {guild_id} is not in the cache -- skipping this event."
+            );
+            return Ok(());
+        };
+        let Some(bot_channel_id) = guild
+            .voice_states
+            .get(&bot_id)
+            .and_then(|state| state.channel_id)
+        else {
+            tracing::warn!(
+                "handle_voice_state_update: guild {guild_id}'s cache has no voice state for the bot itself, even though songbird reports an active call -- skipping this event (auto-leave/auto-pause logic won't run)."
+            );
+            return Ok(());
+        };
+        let (human_count, all_deafened) = summarize_listeners(
+            guild.voice_states.values().map(|state| {
+                (
+                    state.user_id,
+                    state.channel_id,
+                    state.member.as_ref().is_some_and(|member| member.user.bot),
+                    state.self_deaf || state.deaf,
+                )
+            }),
+            bot_id,
+            bot_channel_id,
         );
-        return Ok(());
+        (bot_channel_id, human_count, all_deafened)
     };
-
-    // How many non-bot humans are in the bot's channel, and whether every
-    // one of them is deafened; feeds both blocks below.
-    let (human_count, all_deafened) = ctx
-        .cache
-        .guild(guild_id)
-        .map(|guild| {
-            let humans: Vec<bool> = guild
-                .voice_states
-                .values()
-                .filter(|vs| {
-                    vs.channel_id == Some(bot_channel_id)
-                        && vs.user_id != bot_id
-                        && vs.member.as_ref().is_none_or(|m| !m.user.bot)
-                })
-                .map(|vs| vs.self_deaf || vs.deaf)
-                .collect();
-            let count = humans.len();
-            let all_deaf = count > 0 && humans.into_iter().all(|deafened| deafened);
-            (count, all_deaf)
-        })
-        .unwrap_or((0, false));
     tracing::debug!(
         "handle_voice_state_update: guild {guild_id}, bot_channel_id={bot_channel_id}, human_count={human_count}, all_deafened={all_deafened}"
     );
@@ -682,6 +730,17 @@ pub async fn handle_voice_state_update(
                         "{} guild {guild_id}: all listeners deafened = {all_deafened}",
                         if pause { "Auto-paused" } else { "Auto-resumed" }
                     );
+                    if pause {
+                        stop_progress_ticker(&mut *state_arc.lock().await);
+                    } else {
+                        ensure_progress_ticker(
+                            ctx.http.clone(),
+                            guild_id,
+                            guild_players.clone(),
+                            call.clone(),
+                        )
+                        .await;
+                    }
                     refresh_panel(&ctx.http, guild_id, guild_players, &call).await;
                 }
                 Err(e) => tracing::warn!(
@@ -795,6 +854,7 @@ pub async fn handle_component_interaction(
 
     // Seek buttons lock `call` themselves via `seek_by`, so they're handled
     // outside the `call_lock` block below.
+    let mut pause_state_changed: Option<bool> = None;
     let ephemeral_note = if matches!(custom_id, custom_id::SEEK_BACK | custom_id::SEEK_FORWARD) {
         let delta_secs = if custom_id == custom_id::SEEK_BACK {
             -PANEL_SEEK_STEP_SECS
@@ -831,6 +891,9 @@ pub async fn handle_component_interaction(
                     } else {
                         queue.pause()
                     };
+                    if result.is_ok() {
+                        pause_state_changed = Some(!is_paused);
+                    }
                     result.err().map(|e| format!("⚠️ {e}"))
                 }
                 None => Some("Nothing is playing.".to_string()),
@@ -854,6 +917,24 @@ pub async fn handle_component_interaction(
         }
     };
 
+    // Pause stops the progress ticker (no visible progress to advance and no
+    // reason to keep editing the embed); resume starts it again.
+    if let Some(paused) = pause_state_changed {
+        if paused {
+            if let Some(state_arc) = guild_players.get(&guild_id).map(|entry| entry.clone()) {
+                stop_progress_ticker(&mut *state_arc.lock().await);
+            }
+        } else {
+            ensure_progress_ticker(
+                ctx.http.clone(),
+                guild_id,
+                guild_players.clone(),
+                call.clone(),
+            )
+            .await;
+        }
+    }
+
     if let Some(note) = ephemeral_note {
         let followup = serenity::CreateInteractionResponseFollowup::new()
             .content(note)
@@ -876,8 +957,47 @@ pub async fn handle_component_interaction(
 
 #[cfg(test)]
 mod tests {
-    use super::shares_voice_channel;
+    use super::{shares_voice_channel, summarize_listeners};
     use poise::serenity_prelude as serenity;
+
+    #[test]
+    fn summarize_listeners_counts_only_humans_in_the_bot_channel() {
+        let bot = serenity::UserId::new(1);
+        let bot_channel = serenity::ChannelId::new(10);
+        let other_channel = serenity::ChannelId::new(11);
+        let states = vec![
+            (bot, Some(bot_channel), false, false),
+            (serenity::UserId::new(2), Some(bot_channel), false, false),
+            (serenity::UserId::new(3), Some(bot_channel), false, true),
+            (serenity::UserId::new(4), Some(bot_channel), true, false),
+            (serenity::UserId::new(5), Some(other_channel), false, false),
+        ];
+
+        assert_eq!(
+            summarize_listeners(states.into_iter(), bot, bot_channel),
+            (2, false)
+        );
+    }
+
+    #[test]
+    fn summarize_listeners_reports_all_deafened_only_with_listeners() {
+        let bot = serenity::UserId::new(1);
+        let channel = serenity::ChannelId::new(10);
+        let deafened = vec![
+            (serenity::UserId::new(2), Some(channel), false, true),
+            (serenity::UserId::new(3), Some(channel), false, true),
+        ];
+        assert_eq!(
+            summarize_listeners(deafened.into_iter(), bot, channel),
+            (2, true)
+        );
+
+        let empty: Vec<(serenity::UserId, Option<serenity::ChannelId>, bool, bool)> = Vec::new();
+        assert_eq!(
+            summarize_listeners(empty.into_iter(), bot, channel),
+            (0, false)
+        );
+    }
 
     #[test]
     fn voice_gate_allows_everyone_when_the_bot_is_disconnected() {
