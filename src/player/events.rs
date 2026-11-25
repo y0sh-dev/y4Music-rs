@@ -196,6 +196,7 @@ impl SongbirdEventHandler for LoopHandler {
                         ytdlp_extra_args: self.extra_args.clone(),
                         eq_filter: meta.eq_filter.clone(),
                         seek_time: None,
+                        resolved_stream: meta.resolved_stream.clone(),
                     };
                     let new_meta = Arc::new(TrackMeta {
                         title: meta.title.clone(),
@@ -203,6 +204,7 @@ impl SongbirdEventHandler for LoopHandler {
                         requested_by: meta.requested_by,
                         duration: meta.duration,
                         eq_filter: meta.eq_filter.clone(),
+                        resolved_stream: meta.resolved_stream.clone(),
                         thumbnail: meta.thumbnail.clone(),
                         uploader: meta.uploader.clone(),
                         requester_name: meta.requester_name.clone(),

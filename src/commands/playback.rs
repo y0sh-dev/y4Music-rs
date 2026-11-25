@@ -8,13 +8,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use poise::serenity_prelude as serenity;
-use songbird::input::{Compose, YoutubeDl};
 use songbird::tracks::Track;
 use songbird::{Call, Songbird};
 use sqlx::SqlitePool;
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::audio_source::FfmpegEqSource;
+use crate::audio_source::{FfmpegEqSource, resolve_track};
 use crate::commands::profile::load_or_create_raw;
 use crate::player::{PanelUpdater, PanelUpdaterKind, TrackMeta, derive_youtube_thumbnail};
 use crate::{Context, Error};
@@ -256,6 +255,7 @@ pub(crate) async fn enqueue_known_raw(
         ytdlp_extra_args: extra_args.to_vec(),
         eq_filter: profile.eq_filter.clone(),
         seek_time: None,
+        resolved_stream: None,
     };
     let meta = Arc::new(TrackMeta {
         title: title.to_string(),
@@ -263,6 +263,7 @@ pub(crate) async fn enqueue_known_raw(
         requested_by,
         duration: (duration_secs > 0).then(|| Duration::from_secs(duration_secs as u64)),
         eq_filter: profile.eq_filter,
+        resolved_stream: None,
         thumbnail: derive_youtube_thumbnail(url),
         uploader,
         requester_name,
@@ -299,6 +300,7 @@ pub(crate) async fn enqueue_multiple_known(
             ytdlp_extra_args: extra_args.clone(),
             eq_filter: profile.eq_filter.clone(),
             seek_time: None,
+            resolved_stream: None,
         };
         let meta = Arc::new(TrackMeta {
             title: track.title.clone(),
@@ -306,6 +308,7 @@ pub(crate) async fn enqueue_multiple_known(
             requested_by,
             duration: (track.duration > 0).then(|| Duration::from_secs(track.duration as u64)),
             eq_filter: profile.eq_filter.clone(),
+            resolved_stream: None,
             thumbnail: derive_youtube_thumbnail(&track.url),
             uploader: track.uploader.clone(),
             requester_name: requester_name.clone(),
@@ -360,34 +363,38 @@ pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
 /// Resolves `url`'s metadata (title/duration/thumbnail/uploader) and builds
 /// the `Track` for `/play`/`/playnext`, applying the user's saved
 /// volume/EQ. Returns the built `Track` and its resolved title.
+///
+/// One `yt-dlp -j` call supplies *both* the display metadata and the direct
+/// CDN URL, and the URL is cached on the source and in `TrackMeta` so playback
+/// (and later `/seek` / loop clones) can skip a second resolution until
+/// `STREAM_URL_TTL` expires.
 async fn resolve_and_build_track(ctx: &Context<'_>, url: &str) -> Result<(Track, String), Error> {
-    // Used only for its `aux_metadata()` lookup; playback audio comes from
-    // `FfmpegEqSource` below instead.
-    let mut metadata_source = YoutubeDl::new(ctx.data().http.clone(), url.to_string())
-        .user_args(ctx.data().ytdlp_extra_args.clone());
-    let aux = metadata_source.aux_metadata().await.ok();
-    let title = aux
-        .as_ref()
-        .and_then(|meta| meta.title.clone())
-        .unwrap_or_else(|| url.to_string());
-    let duration = aux.as_ref().and_then(|meta| meta.duration);
-    // Prefer yt-dlp's reported thumbnail over the URL-derived guess.
-    let thumbnail = aux
-        .as_ref()
-        .and_then(|meta| meta.thumbnail.clone())
-        .or_else(|| derive_youtube_thumbnail(url));
-    // Prefer `channel` over `artist`; extractor-dependent field.
-    let uploader = aux
-        .as_ref()
-        .and_then(|meta| meta.channel.clone().or_else(|| meta.artist.clone()));
+    // Run the metadata process and the (local) profile query concurrently.
+    let (resolved, profile) = tokio::join!(
+        resolve_track(url, &ctx.data().ytdlp_extra_args),
+        resolve_playback_profile(&ctx.data().db, ctx.author().id, &ctx.data().eq_hifi_filter),
+    );
+    let resolved = resolved.ok();
 
-    let profile =
-        resolve_playback_profile(&ctx.data().db, ctx.author().id, &ctx.data().eq_hifi_filter).await;
+    let title = resolved
+        .as_ref()
+        .and_then(|track| track.title.clone())
+        .unwrap_or_else(|| url.to_string());
+    let duration = resolved.as_ref().and_then(|track| track.duration);
+    // Prefer yt-dlp's reported thumbnail over the URL-derived guess.
+    let thumbnail = resolved
+        .as_ref()
+        .and_then(|track| track.thumbnail.clone())
+        .or_else(|| derive_youtube_thumbnail(url));
+    let uploader = resolved.as_ref().and_then(|track| track.uploader.clone());
+    let resolved_stream = resolved.map(|track| track.stream);
+
     let source = FfmpegEqSource {
         url: url.to_string(),
         ytdlp_extra_args: ctx.data().ytdlp_extra_args.clone(),
         eq_filter: profile.eq_filter.clone(),
         seek_time: None,
+        resolved_stream: resolved_stream.clone(),
     };
     let meta = Arc::new(TrackMeta {
         title: title.clone(),
@@ -395,6 +402,7 @@ async fn resolve_and_build_track(ctx: &Context<'_>, url: &str) -> Result<(Track,
         requested_by: ctx.author().id,
         duration,
         eq_filter: profile.eq_filter,
+        resolved_stream,
         thumbnail,
         uploader,
         requester_name: ctx.author().display_name().to_string(),

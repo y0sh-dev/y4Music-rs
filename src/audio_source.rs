@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 use std::io::{BufRead, BufReader};
 use std::process::{ChildStderr, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use songbird::input::core::io::{MediaSource, ReadOnlySource};
@@ -20,6 +20,64 @@ const RAW_CHANNELS: u32 = 2;
 /// Upper bound on the `yt-dlp -j` stream-URL resolution call, so a network
 /// stall can't block a track from ever starting (or ending) forever.
 const YTDLP_RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a resolved CDN URL is reused before asking `yt-dlp` again. The
+/// URLs carry their own expiry (typically hours); one hour leaves a wide
+/// safety margin while still letting `/play` -> `/seek` and loop clones skip a
+/// second process spawn in the common case.
+pub const STREAM_URL_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// A direct CDN URL together with when `yt-dlp` resolved it, so callers can
+/// reuse it until [`STREAM_URL_TTL`] elapses.
+#[derive(Clone, Debug)]
+pub struct ResolvedStreamUrl {
+    pub url: String,
+    pub resolved_at: Instant,
+}
+
+impl ResolvedStreamUrl {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            resolved_at: Instant::now(),
+        }
+    }
+
+    /// Whether this cached URL may still be used at `now`.
+    fn is_fresh_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.resolved_at) < STREAM_URL_TTL
+    }
+
+    pub fn is_fresh(&self) -> bool {
+        self.is_fresh_at(Instant::now())
+    }
+}
+
+/// Metadata and the direct stream URL obtained from a single `yt-dlp -j`
+/// call, so `/play` does not need a separate metadata lookup plus a second
+/// playback-time resolution.
+#[derive(Clone, Debug)]
+pub struct ResolvedTrack {
+    pub stream: ResolvedStreamUrl,
+    pub title: Option<String>,
+    pub duration: Option<Duration>,
+    pub thumbnail: Option<String>,
+    pub uploader: Option<String>,
+}
+
+impl ResolvedTrack {
+    fn from_entry(entry: &Value) -> Option<Self> {
+        Some(Self {
+            stream: ResolvedStreamUrl::new(extract_stream_url(entry)?),
+            title: string_field(entry, "title"),
+            duration: duration_from_json(entry.get("duration")),
+            thumbnail: string_field(entry, "thumbnail"),
+            // Prefer `uploader`; fall back to `channel`, which is the field
+            // songbird's YoutubeDl adapter previously surfaced.
+            uploader: string_field(entry, "uploader").or_else(|| string_field(entry, "channel")),
+        })
+    }
+}
 
 /// Lazily resolves `url` to a direct CDN stream URL, then spawns `ffmpeg` to
 /// fetch it and apply the EQ filter, handing songbird the resulting raw PCM.
@@ -35,6 +93,9 @@ pub struct FfmpegEqSource {
     /// `-i`). Used by `/seek` and the panel's seek buttons, which rebuild the
     /// source rather than seeking in place -- see `player::seek_to`.
     pub seek_time: Option<Duration>,
+    /// Direct URL already resolved for this track (e.g. by `/play`'s combined
+    /// metadata lookup), reused until [`STREAM_URL_TTL`] expires.
+    pub resolved_stream: Option<ResolvedStreamUrl>,
 }
 
 #[poise::serenity_prelude::async_trait]
@@ -46,13 +107,20 @@ impl Compose for FfmpegEqSource {
     async fn create_async(
         &mut self,
     ) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
-        spawn_pipeline(
-            &self.url,
-            &self.ytdlp_extra_args,
-            self.eq_filter.as_deref(),
-            self.seek_time,
-        )
-        .await
+        let stream_url = match self
+            .resolved_stream
+            .as_ref()
+            .filter(|cached| cached.is_fresh())
+            .map(|cached| cached.url.clone())
+        {
+            Some(cached) => cached,
+            None => {
+                let resolved = resolve_stream_url(&self.url, &self.ytdlp_extra_args).await?;
+                self.resolved_stream = Some(ResolvedStreamUrl::new(resolved.clone()));
+                resolved
+            }
+        };
+        spawn_pipeline(&stream_url, self.eq_filter.as_deref(), self.seek_time).await
     }
 
     fn should_create_async(&self) -> bool {
@@ -66,9 +134,10 @@ impl From<FfmpegEqSource> for Input {
     }
 }
 
-/// Runs a metadata-only `yt-dlp -j` lookup and extracts a direct,
-/// ffmpeg-fetchable stream URL from its JSON output.
-async fn resolve_stream_url(url: &str, extra_args: &[String]) -> Result<String, AudioStreamError> {
+/// Runs one metadata-only `yt-dlp -j` lookup and returns its first parsable
+/// JSON entry. Both the direct URL and the display metadata come from this
+/// same output.
+async fn fetch_entry(url: &str, extra_args: &[String]) -> Result<Value, AudioStreamError> {
     let mut cmd = tokio::process::Command::new("yt-dlp");
     cmd.args(extra_args)
         .args([
@@ -106,14 +175,35 @@ async fn resolve_stream_url(url: &str, extra_args: &[String]) -> Result<String, 
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let entry: Value = stdout
+    stdout
         .lines()
         .find(|line| !line.trim().is_empty())
         .and_then(|line| serde_json::from_str(line).ok())
         .ok_or_else(|| {
             AudioStreamError::Fail("yt-dlp returned no usable metadata".to_string().into())
-        })?;
+        })
+}
 
+/// Resolves both playback metadata and the direct stream URL in one
+/// `yt-dlp -j` invocation.
+pub async fn resolve_track(
+    url: &str,
+    extra_args: &[String],
+) -> Result<ResolvedTrack, AudioStreamError> {
+    let entry = fetch_entry(url, extra_args).await?;
+    ResolvedTrack::from_entry(&entry).ok_or_else(|| {
+        AudioStreamError::Fail(
+            "yt-dlp did not report a playable stream URL"
+                .to_string()
+                .into(),
+        )
+    })
+}
+
+/// Resolves just the direct URL for callers that do not need metadata (e.g. a
+/// cached URL that expired before playback started).
+async fn resolve_stream_url(url: &str, extra_args: &[String]) -> Result<String, AudioStreamError> {
+    let entry = fetch_entry(url, extra_args).await?;
     extract_stream_url(&entry).ok_or_else(|| {
         AudioStreamError::Fail(
             "yt-dlp did not report a playable stream URL"
@@ -143,6 +233,20 @@ fn extract_stream_url(entry: &Value) -> Option<String> {
         })
         .max_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(u, _)| u)
+}
+
+fn string_field(entry: &Value, key: &str) -> Option<String> {
+    entry.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Converts yt-dlp's `duration` (seconds, sometimes fractional) into a
+/// `Duration`, rejecting non-finite/negative values and absurd lengths that
+/// would make `Duration::from_secs_f64` panic.
+fn duration_from_json(value: Option<&Value>) -> Option<Duration> {
+    const MAX_TRACK_SECONDS: f64 = 60.0 * 60.0 * 24.0 * 365.0;
+    let seconds = value?.as_f64()?;
+    (seconds.is_finite() && seconds > 0.0 && seconds <= MAX_TRACK_SECONDS)
+        .then(|| Duration::from_secs_f64(seconds))
 }
 
 /// Builds the `ffmpeg` argument vector for the HTTP input -> raw PCM output
@@ -210,16 +314,14 @@ fn build_ffmpeg_args(stream_url: &str, filter: &str, seek_time: Option<Duration>
     args
 }
 
-/// Resolves the stream URL, spawns `ffmpeg` to fetch and filter it, and
-/// wraps its stdout as a raw-PCM `AudioStream`.
+/// Spawns `ffmpeg` against an already-resolved direct stream URL, applies
+/// `eq_filter` (or the Balanced profile), and wraps its stdout as a raw-PCM
+/// `AudioStream`.
 async fn spawn_pipeline(
-    url: &str,
-    extra_args: &[String],
+    stream_url: &str,
     eq_filter: Option<&str>,
     seek_time: Option<Duration>,
 ) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
-    let stream_url = resolve_stream_url(url, extra_args).await?;
-
     let filter: Cow<str> = match eq_filter {
         Some(f) => Cow::Borrowed(f),
         None => Cow::Owned(crate::eq::balanced_profile().render()),
@@ -227,7 +329,7 @@ async fn spawn_pipeline(
 
     let mut ffmpeg = std::process::Command::new("ffmpeg");
     ffmpeg
-        .args(build_ffmpeg_args(&stream_url, &filter, seek_time))
+        .args(build_ffmpeg_args(stream_url, &filter, seek_time))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -269,13 +371,16 @@ fn log_stderr_lines(label: &'static str, stderr: ChildStderr) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_ffmpeg_args, extract_stream_url};
+    use super::{
+        ResolvedStreamUrl, ResolvedTrack, STREAM_URL_TTL, build_ffmpeg_args, duration_from_json,
+        extract_stream_url,
+    };
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// Returns a 16-bit stereo PCM WAV of the requested length, encoded in
     /// memory so the test needs no fixture file.
@@ -450,5 +555,60 @@ mod tests {
     fn returns_none_when_nothing_playable_is_present() {
         let entry = json!({"formats": [{"vcodec": "h264", "url": "https://cdn.example.com/video-only.mp4"}]});
         assert_eq!(extract_stream_url(&entry), None);
+    }
+
+    #[test]
+    fn resolved_track_reads_metadata_and_url_from_one_entry() {
+        let entry = json!({
+            "url": "https://cdn.example.com/a.webm",
+            "title": "Song",
+            "duration": 212.061,
+            "thumbnail": "https://img.example.com/t.jpg",
+            "channel": "Channel Name",
+        });
+        let track = ResolvedTrack::from_entry(&entry).expect("resolved track");
+        assert_eq!(track.stream.url, "https://cdn.example.com/a.webm");
+        assert_eq!(track.title.as_deref(), Some("Song"));
+        assert_eq!(track.duration, Some(Duration::from_secs_f64(212.061)));
+        assert_eq!(
+            track.thumbnail.as_deref(),
+            Some("https://img.example.com/t.jpg")
+        );
+        assert_eq!(track.uploader.as_deref(), Some("Channel Name"));
+    }
+
+    #[test]
+    fn resolved_track_prefers_uploader_over_channel() {
+        let entry = json!({
+            "url": "https://cdn.example.com/a.webm",
+            "uploader": "Uploader Name",
+            "channel": "Channel Name",
+        });
+        let track = ResolvedTrack::from_entry(&entry).expect("resolved track");
+        assert_eq!(track.uploader.as_deref(), Some("Uploader Name"));
+    }
+
+    #[test]
+    fn duration_from_json_rejects_non_positive_or_absurd_values() {
+        assert_eq!(
+            duration_from_json(Some(&json!(90))),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(duration_from_json(Some(&json!(0))), None);
+        assert_eq!(duration_from_json(Some(&json!(-1))), None);
+        assert_eq!(duration_from_json(Some(&json!(1.0e30))), None);
+        assert_eq!(duration_from_json(None), None);
+    }
+
+    #[test]
+    fn cached_stream_url_expires_after_the_ttl() {
+        let now = Instant::now();
+        let cached = ResolvedStreamUrl {
+            url: "https://cdn.example.com/a.webm".to_string(),
+            resolved_at: now,
+        };
+        assert!(cached.is_fresh_at(now));
+        assert!(cached.is_fresh_at(now + STREAM_URL_TTL - Duration::from_secs(1)));
+        assert!(!cached.is_fresh_at(now + STREAM_URL_TTL));
     }
 }

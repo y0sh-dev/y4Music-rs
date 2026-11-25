@@ -88,6 +88,7 @@ pub async fn ensure_track_loop_clone(call: &Arc<Mutex<Call>>, extra_args: &[Stri
         ytdlp_extra_args: extra_args.to_vec(),
         eq_filter: meta.eq_filter.clone(),
         seek_time: None,
+        resolved_stream: meta.resolved_stream.clone(),
     };
     let clone_meta = Arc::new(TrackMeta {
         title: meta.title.clone(),
@@ -95,6 +96,7 @@ pub async fn ensure_track_loop_clone(call: &Arc<Mutex<Call>>, extra_args: &[Stri
         requested_by: meta.requested_by,
         duration: meta.duration,
         eq_filter: meta.eq_filter.clone(),
+        resolved_stream: meta.resolved_stream.clone(),
         thumbnail: meta.thumbnail.clone(),
         uploader: meta.uploader.clone(),
         requester_name: meta.requester_name.clone(),
@@ -250,6 +252,7 @@ pub async fn seek_to(
         ytdlp_extra_args: extra_args.to_vec(),
         eq_filter: meta.eq_filter.clone(),
         seek_time: Some(target),
+        resolved_stream: meta.resolved_stream.clone(),
     };
     let new_meta = Arc::new(TrackMeta {
         title: meta.title.clone(),
@@ -257,6 +260,7 @@ pub async fn seek_to(
         requested_by: meta.requested_by,
         duration: meta.duration,
         eq_filter: meta.eq_filter.clone(),
+        resolved_stream: meta.resolved_stream.clone(),
         thumbnail: meta.thumbnail.clone(),
         uploader: meta.uploader.clone(),
         requester_name: meta.requester_name.clone(),
