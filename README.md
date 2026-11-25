@@ -35,7 +35,7 @@
 ### Implemented 
 * **Playback & Queue Control**: URL/search playback, `/playnext` priority insertion, seeking (`/seek` & panel buttons), `Off` / `Track` / `Queue` loop modes, and queue-tail shuffle.
 * **Stateless Event-Driven UI**: Now Playing panel driven by `songbird` `Play` / `End` events with silent rate-limit cooldowns and 404-safe message tracking.
-* **Per-User Audio Profiles**: Persistent default volume (0–200%) and EQ mode (`Balanced` / `Hi-Fi` Proportional-Q + lookahead `compand` + `loudnorm`) via SQLite.
+* **Per-User Audio Profiles**: Persistent default volume (0–200%) and EQ mode (`Balanced` / `Hi-Fi` transparent reference path with protective `lowpass`, lookahead peak control, and `loudnorm`) via SQLite.
 * **Personal & Server Playlists**: Streaming playlist import via `yt-dlp`, track reordering/removal, server-shared playlists with lock & user/role collaborator permissions, and differential mirror sync from a linked external playlist URL (preserving explicitly added tracks).
 * **Voice Lifecycle Hygiene**: Auto-leave when the voice channel becomes empty or the queue stays idle, and auto-pause/resume when all listeners are deafened.
 
