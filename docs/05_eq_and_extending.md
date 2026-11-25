@@ -100,3 +100,11 @@ If an operator sets `EQ_HIFI_FILTER` to an arbitrary `-af` string, it bypasses `
 ### Supporting a new audio source (e.g. SoundCloud)
 
 `FfmpegEqSource` currently passes the URL string straight through to `yt-dlp -j`, so any site `yt-dlp` already supports likely works with no code changes. For a custom protocol `yt-dlp` doesn't support, add a new type implementing `Compose` in `audio_source.rs` and switch to it at the equivalent of `commands/playback.rs::resolve_and_build_track`. Apply the same seek-related constraints described in `02_audio_pipeline.md` (`TrackMeta::start_offset`/`is_seek`) to the new source as well.
+
+---
+
+## Epilogue: Hitting the Discord Opus Wall
+
+After chasing every last bit of resolution across reference IEMs, we ran straight into an obvious physical truth: Discord voice channels re-encode audio in real time at **64–96 kbps Opus** (128 kbps at higher boost tiers). No amount of parametric EQ, lookahead compression, or resampling precision can reconstruct harmonics that a lossy transport throws away—and the better your listening gear gets, the clearer that ceiling becomes.
+
+Rather than fighting a losing battle with DSP tricks, `y4Music-rs` accepts the transport for what it is: `Balanced` keeps casual playback pleasant, `Hi-Fi` steps out of the way, and the project rests here—finished, honest, and at peace with the Opus limit.
