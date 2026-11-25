@@ -234,14 +234,14 @@ pub async fn playlist_show(
 
     match name {
         None => {
-            let playlists = playlist::list(&ctx.data().db, Scope::Solo, user_id).await?;
+            let playlists =
+                playlist::list_with_track_counts(&ctx.data().db, Scope::Solo, user_id).await?;
             if playlists.is_empty() {
                 ctx.say("You have no personal playlists.").await?;
                 return Ok(());
             }
             let mut lines = Vec::with_capacity(playlists.len());
-            for p in &playlists {
-                let count = playlist::tracks(&ctx.data().db, p.id).await?.len();
+            for (p, count) in &playlists {
                 lines.push(format!("📁 **{}** ({count} tracks)", p.name));
             }
             pagination::send_paginated(

@@ -19,6 +19,10 @@ pub async fn init(database_url: &str) -> Result<SqlitePool, crate::Error> {
     let options = SqliteConnectOptions::from_str(database_url)?
         .create_if_missing(true)
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        // WAL's standard durability trade-off: a crash may lose the last
+        // transaction(s) but cannot corrupt the database, while NORMAL avoids
+        // an fsync per commit on the hot playlist/user write paths.
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
         .foreign_keys(true)
         .busy_timeout(std::time::Duration::from_secs(5));
 

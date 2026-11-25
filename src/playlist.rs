@@ -1,6 +1,6 @@
 //! Playlist CRUD and permissions, backed by SQLite.
 
-use sqlx::{Sqlite, SqlitePool, Transaction};
+use sqlx::{FromRow, Row, Sqlite, SqlitePool, Transaction};
 
 use std::collections::HashSet;
 
@@ -74,29 +74,39 @@ pub async fn find(
     Ok(row)
 }
 
-/// Lists every playlist for a user (solo) or guild (server).
-pub async fn list(db: &SqlitePool, scope: Scope, lookup_id: i64) -> Result<Vec<Playlist>, Error> {
-    let rows = match scope {
+/// Lists every playlist for a user (solo) or guild (server), together with
+/// its track count. One `LEFT JOIN ... GROUP BY` query replaces the previous
+/// list-then-`tracks().len()` N+1 pattern used by the show commands.
+pub async fn list_with_track_counts(
+    db: &SqlitePool,
+    scope: Scope,
+    lookup_id: i64,
+) -> Result<Vec<(Playlist, i64)>, Error> {
+    let sql = match scope {
         Scope::Solo => {
-            sqlx::query_as::<_, Playlist>(
-                "SELECT id, name, owner_id, guild_id, scope, locked, source_url FROM playlists \
-             WHERE scope = 'solo' AND owner_id = ? ORDER BY name",
-            )
-            .bind(lookup_id)
-            .fetch_all(db)
-            .await?
+            "SELECT p.id, p.name, p.owner_id, p.guild_id, p.scope, p.locked, \
+                    p.source_url, COUNT(t.id) AS track_count \
+             FROM playlists p LEFT JOIN playlist_tracks t ON t.playlist_id = p.id \
+             WHERE p.scope = 'solo' AND p.owner_id = ? \
+             GROUP BY p.id ORDER BY p.name"
         }
         Scope::Server => {
-            sqlx::query_as::<_, Playlist>(
-                "SELECT id, name, owner_id, guild_id, scope, locked, source_url FROM playlists \
-             WHERE scope = 'server' AND guild_id = ? ORDER BY name",
-            )
-            .bind(lookup_id)
-            .fetch_all(db)
-            .await?
+            "SELECT p.id, p.name, p.owner_id, p.guild_id, p.scope, p.locked, \
+                    p.source_url, COUNT(t.id) AS track_count \
+             FROM playlists p LEFT JOIN playlist_tracks t ON t.playlist_id = p.id \
+             WHERE p.scope = 'server' AND p.guild_id = ? \
+             GROUP BY p.id ORDER BY p.name"
         }
     };
-    Ok(rows)
+
+    let rows = sqlx::query(sql).bind(lookup_id).fetch_all(db).await?;
+    let mut summaries = Vec::with_capacity(rows.len());
+    for row in rows {
+        let playlist = Playlist::from_row(&row)?;
+        let track_count: i64 = row.try_get("track_count")?;
+        summaries.push((playlist, track_count));
+    }
+    Ok(summaries)
 }
 
 /// Creates a new, empty playlist. `creator_id` is only used for
@@ -306,7 +316,7 @@ pub async fn import_tracks_from_stream(
     .await?;
 
     for chunk in received.tracks.chunks(IMPORT_CHUNK_SIZE) {
-        insert_chunk(&mut tx, playlist_id, chunk, next_order, is_synced).await?;
+        insert_chunk(&mut tx, playlist_id, chunk.iter(), next_order, is_synced).await?;
         next_order += chunk.len() as i64;
     }
 
@@ -425,29 +435,29 @@ async fn apply_sync(
     .fetch_all(&mut *tx)
     .await?;
 
-    let mut removed = 0_usize;
-    if !truncated {
+    let stale_ids: Vec<i64> = if truncated {
+        Vec::new()
+    } else {
         let upstream_urls: HashSet<&str> = upstream_unique
             .iter()
             .map(|track| track.webpage_url.as_str())
             .collect();
-        for (id, url, is_synced) in &existing {
-            if *is_synced && !upstream_urls.contains(url.as_str()) {
-                sqlx::query("DELETE FROM playlist_tracks WHERE id = ?")
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?;
-                removed += 1;
-            }
-        }
-    }
+        existing
+            .iter()
+            .filter(|(_, url, is_synced)| *is_synced && !upstream_urls.contains(url.as_str()))
+            .map(|(id, _, _)| *id)
+            .collect()
+    };
+    let removed = stale_ids.len();
+    delete_tracks_by_id(&mut tx, &stale_ids).await?;
 
     let preserved_explicit = existing.iter().filter(|(_, _, synced)| !*synced).count();
-    let mut present: HashSet<String> = existing.into_iter().map(|(_, url, _)| url).collect();
-    let to_insert: Vec<TrackInfo> = upstream_unique
+    // Borrow URLs from `existing` and upstream entries instead of cloning every
+    // `TrackInfo` (title/uploader/URL Strings) into `to_insert`.
+    let mut present: HashSet<&str> = existing.iter().map(|(_, url, _)| url.as_str()).collect();
+    let to_insert: Vec<&TrackInfo> = upstream_unique
         .into_iter()
-        .filter(|track| present.insert(track.webpage_url.clone()))
-        .cloned()
+        .filter(|track| present.insert(track.webpage_url.as_str()))
         .collect();
     let added = to_insert.len();
 
@@ -460,7 +470,14 @@ async fn apply_sync(
         .await?;
 
         for chunk in to_insert.chunks(IMPORT_CHUNK_SIZE) {
-            insert_chunk(&mut tx, playlist_id, chunk, next_order, true).await?;
+            insert_chunk(
+                &mut tx,
+                playlist_id,
+                chunk.iter().copied(),
+                next_order,
+                true,
+            )
+            .await?;
             next_order += chunk.len() as i64;
         }
     }
@@ -474,19 +491,40 @@ async fn apply_sync(
     })
 }
 
+/// Deletes `ids` in bounded chunks, one `DELETE ... IN (...)` per chunk. SQLite
+/// builds commonly cap bind variables far above `IMPORT_CHUNK_SIZE` (100), so
+/// this stays clear of the limit on both old and new versions.
+async fn delete_tracks_by_id(tx: &mut Transaction<'_, Sqlite>, ids: &[i64]) -> Result<(), Error> {
+    for chunk in ids.chunks(IMPORT_CHUNK_SIZE) {
+        let mut builder = sqlx::QueryBuilder::new("DELETE FROM playlist_tracks WHERE id IN (");
+        let mut separated = builder.separated(", ");
+        for id in chunk {
+            separated.push_bind(*id);
+        }
+        separated.push_unseparated(")");
+        builder.build().execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
 /// Bulk-inserts one chunk of tracks via `QueryBuilder`, `added_order`
-/// starting at `start_order`.
-async fn insert_chunk(
+/// starting at `start_order`. Borrows each `TrackInfo` so both the plain
+/// import path (`&[TrackInfo]`) and the sync path (`&[&TrackInfo]`) can share
+/// it without cloning metadata.
+async fn insert_chunk<'a, I>(
     tx: &mut Transaction<'_, Sqlite>,
     playlist_id: i64,
-    chunk: &[TrackInfo],
+    chunk: I,
     start_order: i64,
     is_synced: bool,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    I: IntoIterator<Item = &'a TrackInfo>,
+{
     let mut builder = sqlx::QueryBuilder::new(
         "INSERT INTO playlist_tracks (playlist_id, url, title, uploader, duration, added_order, is_synced) ",
     );
-    builder.push_values(chunk.iter().enumerate(), |mut row, (i, track)| {
+    builder.push_values(chunk.into_iter().enumerate(), |mut row, (i, track)| {
         row.push_bind(playlist_id)
             .push_bind(&track.webpage_url)
             .push_bind(&track.title)
@@ -543,6 +581,39 @@ pub async fn remove_track(
     Ok(track)
 }
 
+/// Renumbers `updates` (track id -> new `added_order`) in one `CASE` UPDATE.
+/// A chunk of `IMPORT_CHUNK_SIZE` rows uses three bind variables each plus the
+/// playlist id, comfortably below SQLite's parameter limit.
+async fn update_added_order_chunk(
+    tx: &mut Transaction<'_, Sqlite>,
+    playlist_id: i64,
+    updates: &[(i64, i64)],
+) -> Result<(), Error> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+
+    let mut builder = sqlx::QueryBuilder::new("UPDATE playlist_tracks SET added_order = CASE id");
+    for (id, position) in updates {
+        builder
+            .push(" WHEN ")
+            .push_bind(*id)
+            .push(" THEN ")
+            .push_bind(*position);
+    }
+    builder
+        .push(" END WHERE playlist_id = ")
+        .push_bind(playlist_id)
+        .push(" AND id IN (");
+    let mut separated = builder.separated(", ");
+    for (id, _) in updates {
+        separated.push_bind(*id);
+    }
+    separated.push_unseparated(")");
+    builder.build().execute(&mut **tx).await?;
+    Ok(())
+}
+
 /// Moves a track from one 1-based position to another, renumbering
 /// `added_order` for the whole playlist inside a transaction. Returns
 /// `false` if either index was out of range.
@@ -570,12 +641,13 @@ pub async fn move_track(
     let moved = ids.remove(from as usize);
     ids.insert(to as usize, moved);
 
-    for (position, id) in ids.iter().enumerate() {
-        sqlx::query("UPDATE playlist_tracks SET added_order = ? WHERE id = ?")
-            .bind(position as i64)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+    let updates: Vec<(i64, i64)> = ids
+        .iter()
+        .enumerate()
+        .map(|(position, id)| (*id, position as i64))
+        .collect();
+    for chunk in updates.chunks(IMPORT_CHUNK_SIZE) {
+        update_added_order_chunk(&mut tx, playlist_id, chunk).await?;
     }
 
     tx.commit().await?;
@@ -717,10 +789,14 @@ pub async fn transfer_ownership(
 
 #[cfg(test)]
 mod tests {
+    use sqlx::Row;
     use sqlx::SqlitePool;
     use sqlx::sqlite::SqlitePoolOptions;
 
-    use super::{SyncResult, apply_sync, commit_sync, has_permission};
+    use super::{
+        Scope, SyncResult, apply_sync, commit_sync, has_permission, list_with_track_counts,
+        move_track,
+    };
     use crate::models::{Collaborator, Playlist};
     use crate::ytdlp::TrackInfo;
 
@@ -742,6 +818,26 @@ mod tests {
             "INSERT INTO playlists (name, owner_id, guild_id, scope, locked) \
              VALUES ('test', 1, NULL, 'solo', 0) RETURNING id",
         )
+        .fetch_one(pool)
+        .await
+        .expect("insert playlist")
+    }
+
+    async fn insert_playlist(
+        pool: &SqlitePool,
+        name: &str,
+        owner_id: i64,
+        guild_id: Option<i64>,
+        scope: &str,
+    ) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO playlists (name, owner_id, guild_id, scope, locked) \
+             VALUES (?, ?, ?, ?, 0) RETURNING id",
+        )
+        .bind(name)
+        .bind(owner_id)
+        .bind(guild_id)
+        .bind(scope)
         .fetch_one(pool)
         .await
         .expect("insert playlist")
@@ -881,6 +977,117 @@ mod tests {
             rows(&pool, playlist_id).await,
             vec![("unseen".to_string(), true), ("new".to_string(), true)]
         );
+    }
+
+    #[tokio::test]
+    async fn sync_deletes_stale_rows_across_delete_chunks() {
+        let pool = memory_pool().await;
+        let playlist_id = seed_playlist(&pool).await;
+        for i in 0..250 {
+            insert_track(&pool, playlist_id, &format!("stale-{i}"), i, true).await;
+        }
+
+        let result = apply_sync(&pool, playlist_id, &[], false)
+            .await
+            .expect("sync");
+
+        assert_eq!(result.removed, 250);
+        assert!(rows(&pool, playlist_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn move_track_renumbers_across_update_chunks() {
+        let pool = memory_pool().await;
+        let playlist_id = seed_playlist(&pool).await;
+        for i in 0..250 {
+            insert_track(&pool, playlist_id, &format!("track-{i}"), i, false).await;
+        }
+
+        assert!(move_track(&pool, playlist_id, 1, 250).await.expect("move"));
+
+        let ordered: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT url, added_order FROM playlist_tracks WHERE playlist_id = ? \
+             ORDER BY added_order",
+        )
+        .bind(playlist_id)
+        .fetch_all(&pool)
+        .await
+        .expect("ordered rows");
+
+        assert_eq!(ordered.len(), 250);
+        assert_eq!(ordered[0].0, "track-1");
+        assert_eq!(ordered[249].0, "track-0");
+        assert!(
+            ordered
+                .iter()
+                .enumerate()
+                .all(|(position, (_, order))| *order == position as i64)
+        );
+
+        assert!(!move_track(&pool, playlist_id, 0, 1).await.expect("move"));
+        assert!(!move_track(&pool, playlist_id, 1, 251).await.expect("move"));
+    }
+
+    #[tokio::test]
+    async fn list_with_track_counts_matches_per_playlist_counts() {
+        let pool = memory_pool().await;
+        let solo_a = insert_playlist(&pool, "a", 1, None, "solo").await;
+        let solo_b = insert_playlist(&pool, "b", 1, None, "solo").await;
+        insert_track(&pool, solo_a, "a1", 0, false).await;
+        insert_track(&pool, solo_a, "a2", 1, false).await;
+
+        let solo = list_with_track_counts(&pool, Scope::Solo, 1)
+            .await
+            .expect("solo list");
+        let solo_counts: Vec<(&str, i64)> = solo
+            .iter()
+            .map(|(playlist, count)| (playlist.name.as_str(), *count))
+            .collect();
+        assert_eq!(solo_counts, vec![("a", 2), ("b", 0)]);
+        assert_eq!(solo_b, solo[1].0.id);
+
+        let server = insert_playlist(&pool, "shared", 10, Some(42), "server").await;
+        insert_track(&pool, server, "s1", 0, true).await;
+        let shared = list_with_track_counts(&pool, Scope::Server, 42)
+            .await
+            .expect("server list");
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].0.name, "shared");
+        assert_eq!(shared[0].1, 1);
+    }
+
+    #[tokio::test]
+    async fn playlist_lookup_queries_use_an_index_not_a_full_scan() {
+        let pool = memory_pool().await;
+        let queries = [
+            "EXPLAIN QUERY PLAN SELECT id, name, owner_id, guild_id, scope, locked, source_url \
+             FROM playlists WHERE scope = 'solo' AND owner_id = 1 AND name = 'x'",
+            "EXPLAIN QUERY PLAN SELECT id, name, owner_id, guild_id, scope, locked, source_url \
+             FROM playlists WHERE scope = 'server' AND guild_id = 1 AND name = 'x'",
+            "EXPLAIN QUERY PLAN SELECT id, name, owner_id, guild_id, scope, locked, source_url \
+             FROM playlists WHERE scope = 'solo' AND owner_id = 1 ORDER BY name",
+            "EXPLAIN QUERY PLAN SELECT id, name, owner_id, guild_id, scope, locked, source_url \
+             FROM playlists WHERE scope = 'server' AND guild_id = 1 ORDER BY name",
+        ];
+
+        for sql in queries {
+            let plan: Vec<String> = sqlx::query(sql)
+                .fetch_all(&pool)
+                .await
+                .expect("explain")
+                .into_iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains("SEARCH playlists")),
+                "expected an index SEARCH, got: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|detail| detail.contains("SCAN playlists")),
+                "unexpected full scan: {plan:?}"
+            );
+        }
     }
 
     #[test]
