@@ -221,37 +221,34 @@ fn resolve_seek_target(duration: Option<Duration>, target: Duration) -> Result<D
     }
 }
 
-/// Seeks the currently playing track to an absolute position, by building a
-/// new `Track` (via `FfmpegEqSource::seek_time`) and swapping it in for the
-/// current one -- songbird's native seek doesn't support custom `Compose`
-/// sources. Used by `/seek` and, via `seek_by`, the panel's ⏪/⏩ buttons.
-///
-/// Clamped to `[0, duration]`. Tracks whose duration is unknown (live
-/// streams, or sources yt-dlp reported no duration for) are rejected: seeking
-/// them could land past EOF and produce an empty PCM stream, which songbird
-/// would surface as an immediate `End` rather than a usable position.
-///
-/// Returns the actual (clamped) position on success, or a user-facing error
-/// string otherwise.
-pub async fn seek_to(
-    call: &Arc<Mutex<Call>>,
+/// Adds `delta_secs` (signed) to `current_pos`, saturating at zero for
+/// rewind/past-the-start presses.
+fn relative_seek_target(current_pos: Duration, delta_secs: i64) -> Duration {
+    if delta_secs.is_negative() {
+        current_pos.saturating_sub(Duration::from_secs(delta_secs.unsigned_abs()))
+    } else {
+        current_pos.saturating_add(Duration::from_secs(delta_secs as u64))
+    }
+}
+
+/// Builds the seek replacement and swaps it in. The caller must already hold
+/// `Call`'s lock, so `seek_to` and `seek_by` each acquire it exactly once
+/// (previously `seek_by` read the position, dropped the lock, then re-locked
+/// inside `seek_to`, leaving a window where the current track could change).
+async fn replace_with_seek(
+    call: &mut Call,
+    meta: &TrackMeta,
     extra_args: &[String],
     target: Duration,
+    volume: f32,
 ) -> Result<Duration, String> {
-    let mut call = call.lock().await;
-
-    let Some(current) = call.queue().current() else {
-        return Err("Nothing is playing.".to_string());
-    };
-    let meta = current.data::<TrackMeta>();
-    let target = resolve_seek_target(meta.duration, target)?;
-    let volume = current.get_info().await.map(|s| s.volume).unwrap_or(1.0);
-
     let source = FfmpegEqSource {
         url: meta.url.clone(),
         ytdlp_extra_args: extra_args.to_vec(),
         eq_filter: meta.eq_filter.clone(),
         seek_time: Some(target),
+        // Reuse the direct URL `/play` already resolved (until its TTL), so a
+        // seek does not need another yt-dlp process spawn in the common case.
         resolved_stream: meta.resolved_stream.clone(),
     };
     let new_meta = Arc::new(TrackMeta {
@@ -293,6 +290,35 @@ pub async fn seek_to(
     Ok(target)
 }
 
+/// Seeks the currently playing track to an absolute position, by building a
+/// new `Track` (via `FfmpegEqSource::seek_time`) and swapping it in for the
+/// current one -- songbird's native seek doesn't support custom `Compose`
+/// sources. Used by `/seek` and, via `seek_by`, the panel's ⏪/⏩ buttons.
+///
+/// Clamped to `[0, duration]`. Tracks whose duration is unknown (live
+/// streams, or sources yt-dlp reported no duration for) are rejected: seeking
+/// them could land past EOF and produce an empty PCM stream, which songbird
+/// would surface as an immediate `End` rather than a usable position.
+///
+/// Returns the actual (clamped) position on success, or a user-facing error
+/// string otherwise.
+pub async fn seek_to(
+    call: &Arc<Mutex<Call>>,
+    extra_args: &[String],
+    target: Duration,
+) -> Result<Duration, String> {
+    let mut call = call.lock().await;
+
+    let Some(current) = call.queue().current() else {
+        return Err("Nothing is playing.".to_string());
+    };
+    let meta = current.data::<TrackMeta>();
+    let target = resolve_seek_target(meta.duration, target)?;
+    let volume = current.get_info().await.map(|s| s.volume).unwrap_or(1.0);
+
+    replace_with_seek(&mut call, &meta, extra_args, target, volume).await
+}
+
 /// Seeks the currently playing track by `delta_secs` seconds (negative
 /// rewinds), relative to its current position (`state.position +
 /// meta.start_offset`, to account for a track already seeked once).
@@ -301,31 +327,30 @@ pub async fn seek_by(
     extra_args: &[String],
     delta_secs: i64,
 ) -> Result<Duration, String> {
-    let current_pos = {
-        let call = call.lock().await;
-        let Some(current) = call.queue().current() else {
-            return Err("Nothing is playing.".to_string());
-        };
-        let meta = current.data::<TrackMeta>();
-        let position = current
-            .get_info()
-            .await
-            .map(|s| s.position)
-            .map_err(|e| format!("⚠️ {e}"))?;
-        position + meta.start_offset
+    let mut call = call.lock().await;
+    let Some(current) = call.queue().current() else {
+        return Err("Nothing is playing.".to_string());
     };
-    let target = if delta_secs.is_negative() {
-        current_pos.saturating_sub(Duration::from_secs(delta_secs.unsigned_abs()))
-    } else {
-        current_pos.saturating_add(Duration::from_secs(delta_secs as u64))
-    };
-    seek_to(call, extra_args, target).await
+    let meta = current.data::<TrackMeta>();
+    let info = current.get_info().await.map_err(|e| format!("⚠️ {e}"))?;
+    let target = relative_seek_target(info.position + meta.start_offset, delta_secs);
+    let target = resolve_seek_target(meta.duration, target)?;
+
+    replace_with_seek(&mut call, &meta, extra_args, target, info.volume).await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_seek_target, shuffle_slice, shuffle_start_index};
+    use super::{relative_seek_target, resolve_seek_target, shuffle_slice, shuffle_start_index};
     use std::time::Duration;
+
+    #[test]
+    fn relative_seek_target_handles_forward_rewind_and_the_start_boundary() {
+        let position = Duration::from_secs(30);
+        assert_eq!(relative_seek_target(position, 10), Duration::from_secs(40));
+        assert_eq!(relative_seek_target(position, -10), Duration::from_secs(20));
+        assert_eq!(relative_seek_target(position, -60), Duration::ZERO);
+    }
 
     #[test]
     fn resolve_seek_target_clamps_to_a_known_duration() {
