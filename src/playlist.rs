@@ -1,6 +1,6 @@
 //! Playlist CRUD and permissions, backed by SQLite.
 
-use sqlx::{Sqlite, SqlitePool, Transaction};
+use sqlx::{FromRow, Row, Sqlite, SqlitePool, Transaction};
 
 use std::collections::HashSet;
 
@@ -74,29 +74,39 @@ pub async fn find(
     Ok(row)
 }
 
-/// Lists every playlist for a user (solo) or guild (server).
-pub async fn list(db: &SqlitePool, scope: Scope, lookup_id: i64) -> Result<Vec<Playlist>, Error> {
-    let rows = match scope {
+/// Lists every playlist for a user (solo) or guild (server), together with
+/// its track count. One `LEFT JOIN ... GROUP BY` query replaces the previous
+/// list-then-`tracks().len()` N+1 pattern used by the show commands.
+pub async fn list_with_track_counts(
+    db: &SqlitePool,
+    scope: Scope,
+    lookup_id: i64,
+) -> Result<Vec<(Playlist, i64)>, Error> {
+    let sql = match scope {
         Scope::Solo => {
-            sqlx::query_as::<_, Playlist>(
-                "SELECT id, name, owner_id, guild_id, scope, locked, source_url FROM playlists \
-             WHERE scope = 'solo' AND owner_id = ? ORDER BY name",
-            )
-            .bind(lookup_id)
-            .fetch_all(db)
-            .await?
+            "SELECT p.id, p.name, p.owner_id, p.guild_id, p.scope, p.locked, \
+                    p.source_url, COUNT(t.id) AS track_count \
+             FROM playlists p LEFT JOIN playlist_tracks t ON t.playlist_id = p.id \
+             WHERE p.scope = 'solo' AND p.owner_id = ? \
+             GROUP BY p.id ORDER BY p.name"
         }
         Scope::Server => {
-            sqlx::query_as::<_, Playlist>(
-                "SELECT id, name, owner_id, guild_id, scope, locked, source_url FROM playlists \
-             WHERE scope = 'server' AND guild_id = ? ORDER BY name",
-            )
-            .bind(lookup_id)
-            .fetch_all(db)
-            .await?
+            "SELECT p.id, p.name, p.owner_id, p.guild_id, p.scope, p.locked, \
+                    p.source_url, COUNT(t.id) AS track_count \
+             FROM playlists p LEFT JOIN playlist_tracks t ON t.playlist_id = p.id \
+             WHERE p.scope = 'server' AND p.guild_id = ? \
+             GROUP BY p.id ORDER BY p.name"
         }
     };
-    Ok(rows)
+
+    let rows = sqlx::query(sql).bind(lookup_id).fetch_all(db).await?;
+    let mut summaries = Vec::with_capacity(rows.len());
+    for row in rows {
+        let playlist = Playlist::from_row(&row)?;
+        let track_count: i64 = row.try_get("track_count")?;
+        summaries.push((playlist, track_count));
+    }
+    Ok(summaries)
 }
 
 /// Creates a new, empty playlist. `creator_id` is only used for
@@ -779,10 +789,14 @@ pub async fn transfer_ownership(
 
 #[cfg(test)]
 mod tests {
+    use sqlx::Row;
     use sqlx::SqlitePool;
     use sqlx::sqlite::SqlitePoolOptions;
 
-    use super::{SyncResult, apply_sync, commit_sync, has_permission};
+    use super::{
+        Scope, SyncResult, apply_sync, commit_sync, has_permission, list_with_track_counts,
+        move_track,
+    };
     use crate::models::{Collaborator, Playlist};
     use crate::ytdlp::TrackInfo;
 
@@ -804,6 +818,26 @@ mod tests {
             "INSERT INTO playlists (name, owner_id, guild_id, scope, locked) \
              VALUES ('test', 1, NULL, 'solo', 0) RETURNING id",
         )
+        .fetch_one(pool)
+        .await
+        .expect("insert playlist")
+    }
+
+    async fn insert_playlist(
+        pool: &SqlitePool,
+        name: &str,
+        owner_id: i64,
+        guild_id: Option<i64>,
+        scope: &str,
+    ) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO playlists (name, owner_id, guild_id, scope, locked) \
+             VALUES (?, ?, ?, ?, 0) RETURNING id",
+        )
+        .bind(name)
+        .bind(owner_id)
+        .bind(guild_id)
+        .bind(scope)
         .fetch_one(pool)
         .await
         .expect("insert playlist")
@@ -992,6 +1026,68 @@ mod tests {
 
         assert!(!move_track(&pool, playlist_id, 0, 1).await.expect("move"));
         assert!(!move_track(&pool, playlist_id, 1, 251).await.expect("move"));
+    }
+
+    #[tokio::test]
+    async fn list_with_track_counts_matches_per_playlist_counts() {
+        let pool = memory_pool().await;
+        let solo_a = insert_playlist(&pool, "a", 1, None, "solo").await;
+        let solo_b = insert_playlist(&pool, "b", 1, None, "solo").await;
+        insert_track(&pool, solo_a, "a1", 0, false).await;
+        insert_track(&pool, solo_a, "a2", 1, false).await;
+
+        let solo = list_with_track_counts(&pool, Scope::Solo, 1)
+            .await
+            .expect("solo list");
+        let solo_counts: Vec<(&str, i64)> = solo
+            .iter()
+            .map(|(playlist, count)| (playlist.name.as_str(), *count))
+            .collect();
+        assert_eq!(solo_counts, vec![("a", 2), ("b", 0)]);
+        assert_eq!(solo_b, solo[1].0.id);
+
+        let server = insert_playlist(&pool, "shared", 10, Some(42), "server").await;
+        insert_track(&pool, server, "s1", 0, true).await;
+        let shared = list_with_track_counts(&pool, Scope::Server, 42)
+            .await
+            .expect("server list");
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].0.name, "shared");
+        assert_eq!(shared[0].1, 1);
+    }
+
+    #[tokio::test]
+    async fn playlist_lookup_queries_use_an_index_not_a_full_scan() {
+        let pool = memory_pool().await;
+        let queries = [
+            "EXPLAIN QUERY PLAN SELECT id, name, owner_id, guild_id, scope, locked, source_url \
+             FROM playlists WHERE scope = 'solo' AND owner_id = 1 AND name = 'x'",
+            "EXPLAIN QUERY PLAN SELECT id, name, owner_id, guild_id, scope, locked, source_url \
+             FROM playlists WHERE scope = 'server' AND guild_id = 1 AND name = 'x'",
+            "EXPLAIN QUERY PLAN SELECT id, name, owner_id, guild_id, scope, locked, source_url \
+             FROM playlists WHERE scope = 'solo' AND owner_id = 1 ORDER BY name",
+            "EXPLAIN QUERY PLAN SELECT id, name, owner_id, guild_id, scope, locked, source_url \
+             FROM playlists WHERE scope = 'server' AND guild_id = 1 ORDER BY name",
+        ];
+
+        for sql in queries {
+            let plan: Vec<String> = sqlx::query(sql)
+                .fetch_all(&pool)
+                .await
+                .expect("explain")
+                .into_iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains("SEARCH playlists")),
+                "expected an index SEARCH, got: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|detail| detail.contains("SCAN playlists")),
+                "unexpected full scan: {plan:?}"
+            );
+        }
     }
 
     #[test]

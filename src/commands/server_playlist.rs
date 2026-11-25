@@ -121,15 +121,15 @@ pub async fn serverplaylist_show(
 
     match name {
         None => {
-            let playlists = playlist::list(&ctx.data().db, Scope::Server, guild_id).await?;
+            let playlists =
+                playlist::list_with_track_counts(&ctx.data().db, Scope::Server, guild_id).await?;
             if playlists.is_empty() {
                 ctx.say("There are no shared playlists on this server yet.")
                     .await?;
                 return Ok(());
             }
             let mut lines = Vec::with_capacity(playlists.len());
-            for p in &playlists {
-                let count = playlist::tracks(&ctx.data().db, p.id).await?.len();
+            for (p, count) in &playlists {
                 let lock_icon = if p.locked { " 🔐" } else { "" };
                 lines.push(format!(
                     "📁 **{}**{lock_icon}\n> Owner: <@{}>, Tracks: {count}",
