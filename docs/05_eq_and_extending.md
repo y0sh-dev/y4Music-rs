@@ -33,49 +33,41 @@ impl EqProfile {
 
 There is no `pre_gain_db` and no `resample_precision` field anymore -- both were removed (see "Removal of Pre-Gain" below). `render()` now opens every profile with a single fixed resample stage, `aresample=48000:resampler=swr:precision=28:cutoff=0.97`, regardless of profile; no per-profile precision knob exists.
 
-`render()`'s assembly order is the signal-flow order: `aresample` (fixed) -> `anequalizer` (EQ bands) -> `lowpass` (only if `Some`) -> (`asubboost`/`extrastereo`/`aecho`, all unused by the current profiles) -> `compand` -> `loudnorm`. Lowpass sits right after `anequalizer` so it trims whatever high-frequency energy the EQ bands didn't already remove before that energy reaches the compressor/loudness stage.
+`render()`'s assembly order is the signal-flow order: `aresample` (fixed) -> `anequalizer` (only when `bands` is non-empty) -> `lowpass` (only if `Some`) -> (`asubboost`/`extrastereo`/`aecho`, all unused by the current profiles) -> `compand` -> `loudnorm`. Lowpass sits right after the EQ stage (or directly after `aresample` when there are no bands) so it trims high-frequency energy before that energy reaches the compressor/loudness stage.
 
-Fields that are `Option`/`Vec` signal "this profile doesn't use it" -- e.g. `balanced_profile()` leaves `sub_boost`/`stereo_width`/`echo` all `None`, keeping it to plain band correction plus normalization.
+Fields that are `Option`/`Vec` signal "this profile doesn't use it" -- e.g. `balanced_profile()` leaves `sub_boost`/`stereo_width`/`echo` all `None`, keeping it to plain band correction plus normalization; `default_hifi_profile()` additionally leaves `bands` empty and drops the spatial effects, emitting only the protective stages.
 
 ## Balanced vs Hi-Fi Settings Comparison
 
 | Parameter | Balanced | Hi-Fi |
 |---|---|---|
 | Resample | `precision=28:cutoff=0.97` (fixed, both profiles) | same |
-| Band 1 | 60Hz / w15 / +1.5dB | 60Hz / w50 / +0.8dB |
-| Band 2 | -- | 120Hz / w100 / +0.4dB |
-| Band 3 | -- | 250Hz / w180 / -0.5dB |
-| Band 4 | -- | 500Hz / w350 / +0.3dB |
-| Band 5 | -- | 2000Hz / w1400 / +0.2dB |
-| Band 6 | -- | 5500Hz / w3500 / -0.4dB |
-| Band 7 | -- | 8000Hz / w5500 / +0.4dB |
-| Band 8 | -- | 11000Hz / w7500 / +0.3dB |
-| Band 9 | -- | 14000Hz / w9500 / +0.2dB |
-| Lowpass (`lowpass`) | -- | 18000Hz |
+| EQ bands (`anequalizer`) | 60Hz / w15 / +1.5dB | none (uncoloured reference path) |
+| Lowpass (`lowpass`) | -- | 17500Hz |
 | Sub-bass boost (`asubboost`) | -- | dropped |
 | Stereo width (`extrastereo`) | -- | dropped |
 | Echo (`aecho`) | -- | dropped |
-| Compressor attack / decay | 0.02s / 0.1s | 0.01s / 0.15s |
-| Compressor points | -80/-80\|-35/-35\|0/-5 | -80/-80\|-18/-18\|0/-2.5 |
-| Compressor soft-knee | 0.01 | 6.0 |
-| Compressor lookahead (`delay_s`) | 0s | 0.01s |
-| Loudness target | I=-16 LUFS / LRA=10 / TP=-2.0dB | I=-16 LUFS / LRA=11 / TP=-1.5dB |
+| Compressor attack / decay | 0.02s / 0.1s | 0.005s / 0.1s |
+| Compressor points | -80/-80\|-35/-35\|0/-5 | -80/-80\|-6/-6\|0/-1 |
+| Compressor soft-knee | 0.01 | 3.0 |
+| Compressor lookahead (`delay_s`) | 0s | 0.005s |
+| Loudness target | I=-16 LUFS / LRA=10 / TP=-2.0dB | I=-16 LUFS / LRA=14 / TP=-1.5dB |
 
 ### Removal of Pre-Gain (Leveraging 32-bit Float)
 
 The previous `-6dB` pre-gain (ffmpeg's `volume` filter, applied before any EQ boost) existed to protect fixed-point headroom: without it, a boosted band could push a sample past 0dBFS and clip. FFmpeg's internal pipeline here runs in `f32le` (32-bit float), where intermediate values aren't clamped to `[-1.0, 1.0]` between filter stages -- a band boost can exceed 0dBFS mid-chain without clipping, and `loudnorm` at the end of the chain still receives the signal's full dynamic range intact. Pre-gain bought no real protection on this pipeline; it only shifted the compander's effective input level, which is exactly the mismatch the DSP audit flagged as skewing `compand`'s behavior. Removing it means one less parameter to keep in sync between profiles and no more implicit level offset for the compressor to compensate for.
 
-### Proportional-Q 9-Band EQ
+### Transparent Reference Path (No EQ Bands)
 
-The prior 6-band design used a handful of fixed absolute `width_hz` values across widely different center frequencies, which produced disproportionately wide skirts at the high end relative to their own frequency. Summed with the neighboring bands' skirts in `anequalizer`'s per-band biquads, that imbalance produced comb-filtering-like ripple in the upper register. The current 9 bands are proportional-Q: `width_hz` is sized relative to `freq_hz` at every band (Q ≈ 1.2-1.5 throughout, e.g. 60Hz/w50 ≈ Q1.2, 14000Hz/w9500 ≈ Q1.47), so each band's skirt scales consistently with its own center frequency instead of ballooning at the top of the spectrum. The result is a smoother, more even mastering curve across the full band, not concentrated cuts/boosts fighting each other in specific registers.
+Hi-Fi is deliberately *not* a second voicing. `bands` is empty, so `render()` emits no `anequalizer` stage at all: whatever the source contains reaches the listener's own high-resolution gear, room correction, or system-wide EQ (EasyEffects and similar) without the bot stacking another tonal curve on top. Balanced remains the opinionated profile for listeners who want a mild bass lift and consistent loudness out of the box. The remaining Hi-Fi stages are protective only (bandwidth guard, peak control, loudness targeting), and `EQ_HIFI_FILTER` still allows a fully custom curve when an operator wants one.
 
-### Lookahead Compression & Soft-Knee
+### Transparent Peak Protection (Lookahead Compression & Soft-Knee)
 
-The previous compander used a zero-lookahead, effectively hard-knee curve, which reacts to a transient only after it has already happened -- audible as "pumping" (a momentary volume dip/swell) on percussive material, which is common in Nightcore-style high-BPM tracks (kick drums, sharp transients). `Compand::delay_s` (0.01s on Hi-Fi) implements a lookahead: the signal is held briefly so the level detector sees the transient slightly ahead of the gain stage acting on it, letting the compressor start reacting before the peak arrives instead of chasing it. `Compand::soft_knee` (6.0 on Hi-Fi, vs. Balanced's near-hard 0.01) rounds the transition around each breakpoint in `points` rather than bending sharply, so gain reduction eases in instead of snapping on. Together with the faster attack (0.01s) and slower decay (0.15s), this keeps transients controlled without the audible gain-riding of the previous curve.
+Hi-Fi's `compand` no longer shapes average loudness: the first two breakpoints are 1:1 (`-80/-80`, `-6/-6`), so everything at or below -6 dBFS passes through untouched. Only peaks above -6 dBFS are eased down (`0/-1`), preventing the occasional transient from clipping without compressing the body of the music. `Compand::delay_s` (0.005s on Hi-Fi) holds the signal briefly so the level detector sees a transient slightly ahead of the gain stage acting on it, and `Compand::soft_knee` (3.0 on Hi-Fi, vs. Balanced's near-hard 0.01) rounds the transition around the breakpoint. The faster attack (0.005s) catches peaks while the 0.1s decay releases quickly enough not to ride the programme material. Balanced keeps its gentler, louder average-level compression.
 
-### Lowpass (18000Hz): Reducing Encoder Load (Nightcore Mitigation)
+### Lowpass (17500Hz): Reducing Encoder Load (Nightcore Mitigation)
 
-Hi-Fi's `lowpass_hz: Some(18_000.0)` inserts `lowpass=f=18000` right after `anequalizer`, cutting frequency content above 18kHz that's inaudible to nearly everyone. High-BPM/high-entropy material (Nightcore and similar) packs disproportionate energy in that range; left in, it inflates the Opus encoder's bitrate demand enough to contribute to packet loss under Discord's bandwidth cap (see `commands::playback::resolve_target_bitrate`'s token-bucket limiting), audible as playback stutter. Cutting it above the EQ bands sheds that load before it reaches the compressor/loudness stage, without touching anything a listener would notice. Balanced leaves `lowpass_hz: None` and does not apply this.
+Hi-Fi's `lowpass_hz: Some(17_500.0)` inserts `lowpass=f=17500` right after `aresample` (there is no `anequalizer` in this profile), cutting frequency content above 17.5kHz that's inaudible to nearly everyone. High-BPM/high-entropy material (Nightcore and similar) packs disproportionate energy in that range; left in, it inflates the Opus encoder's bitrate demand enough to contribute to packet loss under Discord's bandwidth cap (see `commands::playback::resolve_target_bitrate`'s token-bucket limiting), audible as playback stutter. Shedding it before the compressor/loudness stage keeps that protection without touching anything a listener would notice. Balanced leaves `lowpass_hz: None` and does not apply this.
 
 ## `EQ_HIFI_FILTER` Environment Variable: a Raw-String Escape Hatch
 

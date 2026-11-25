@@ -186,105 +186,52 @@ pub fn balanced_profile() -> EqProfile {
 /// `EQ_HIFI_FILTER` (an arbitrary raw `-af` string, bypassing this profile
 /// entirely).
 ///
-/// A 9-band proportional-Q parametric EQ (Q ≈ 1.2-1.5, i.e. `width_hz` is
-/// sized relative to `freq_hz` at every band rather than using a handful of
-/// fixed absolute widths). The previous 6-band design used disproportionately
-/// wide high-band widths relative to their center frequency, which -- summed
-/// with the neighboring bands' skirts in `anequalizer`'s per-band biquads --
-/// produced comb-filter-like ripple in the upper register. Proportional-Q
-/// sizing keeps each band's skirt in scale with its own center frequency, so
-/// adjacent bands overlap consistently across the spectrum instead of
-/// clashing more in some registers than others.
+/// This is a **transparent / uncoloured reference path**, not a second
+/// voicing. `bands` is deliberately empty, so `EqProfile::render` emits no
+/// `anequalizer=` at all: listeners with high-resolution gear or their own
+/// system-wide EQ (EasyEffects and similar) hear the source, not the bot's
+/// taste layered on top of theirs. Balanced remains the opinionated,
+/// everyone-friendly profile.
 ///
-/// `sub_boost`/`stereo_width`/`echo` are all dropped -- these spatial
-/// effects added CPU cost and clipping risk without a clearly audible
+/// Only protective stages remain:
+///
+/// - `lowpass_hz: Some(17_500.0)` sheds content above 17.5 kHz that is
+///   inaudible to nearly everyone and otherwise inflates the Opus encoder's
+///   bitrate demand on high-entropy/high-BPM material (see
+///   `commands::playback::resolve_target_bitrate` and the Discord bandwidth
+///   cap that can turn that into stutter).
+/// - `compand` is transient protection rather than loudness colouring:
+///   everything at or below -6 dBFS passes 1:1 (`-80/-80`, `-6/-6`), only
+///   peaks above it are eased down to `0/-1`. A 5 ms `delay_s` lookahead lets
+///   the detector see a transient before the gain stage acts on it, with
+///   `soft_knee: 3.0` smoothing the transition.
+/// - `loudnorm` keeps the -16 LUFS / -1.5 dBTP targets but widens `LRA` to
+///   14 so the source's dynamics are not squashed toward a narrow target.
+///
+/// There is still no pre-gain stage: 32-bit float processing has no
+/// fixed-point headroom to protect, and trimming gain before the compressor
+/// only skewed its effective input level. `sub_boost`/`stereo_width`/`echo`
+/// remain dropped: they add cost and clipping risk without a clearly audible
 /// benefit once re-encoded through Discord's Opus pipeline.
-///
-/// There is no pre-gain stage (see `EqProfile::render`): 32-bit float
-/// processing has no fixed-point headroom to protect, so trimming gain
-/// before the EQ bands only shifted the compressor's effective input level
-/// without adding any real protection -- exactly the "pre-gain throws off
-/// the compander" mismatch the DSP audit flagged. `compand` compensates
-/// with a tighter `attack_s`/`decay_s`, a soft knee (`soft_knee`) instead of
-/// a hard bend at each breakpoint, and a short `delay_s` lookahead so the
-/// level detector sees a transient slightly before the gain stage acts on
-/// it, rather than reacting after the fact -- both reduce audible pumping
-/// compared to the previous zero-lookahead, hard-knee curve.
-///
-/// `lowpass_hz: Some(18_000.0)` is Hi-Fi-specific: high-BPM/high-entropy
-/// material (Nightcore and similar) packs far more energy above 18kHz than
-/// Balanced's source material typically does, and that inaudible-to-nearly-
-/// everyone content was inflating the Opus encoder's bitrate demand enough
-/// to contribute to packet loss -- stutter -- under Discord's bandwidth cap
-/// (see `commands::playback::resolve_target_bitrate`). Cutting it above the
-/// EQ bands sheds that load without touching anything a listener would
-/// notice.
 pub fn default_hifi_profile() -> EqProfile {
     EqProfile {
-        bands: vec![
-            EqBand {
-                freq_hz: 60.0,
-                width_hz: 50.0,
-                gain_db: 0.8,
-            },
-            EqBand {
-                freq_hz: 120.0,
-                width_hz: 100.0,
-                gain_db: 0.4,
-            },
-            EqBand {
-                freq_hz: 250.0,
-                width_hz: 180.0,
-                gain_db: -0.5,
-            },
-            EqBand {
-                freq_hz: 500.0,
-                width_hz: 350.0,
-                gain_db: 0.3,
-            },
-            EqBand {
-                freq_hz: 2_000.0,
-                width_hz: 1_400.0,
-                gain_db: 0.2,
-            },
-            EqBand {
-                freq_hz: 5_500.0,
-                width_hz: 3_500.0,
-                gain_db: -0.4,
-            },
-            EqBand {
-                freq_hz: 8_000.0,
-                width_hz: 5_500.0,
-                gain_db: 0.4,
-            },
-            EqBand {
-                freq_hz: 11_000.0,
-                width_hz: 7_500.0,
-                gain_db: 0.3,
-            },
-            EqBand {
-                freq_hz: 14_000.0,
-                width_hz: 9_500.0,
-                gain_db: 0.2,
-            },
-        ],
+        // Empty on purpose: `render()` omits `anequalizer=` entirely.
+        bands: Vec::new(),
         sub_boost: None,
         stereo_width: None,
         echo: None,
-        // Cuts inaudible (to nearly everyone) high-frequency content that
-        // otherwise inflates the Opus encoder's bitrate demand on
-        // high-entropy/high-BPM material (e.g. Nightcore).
-        lowpass_hz: Some(18_000.0),
+        // Protects the Opus encoder from inaudible ultra-high-frequency load.
+        lowpass_hz: Some(17_500.0),
         compand: Compand {
-            attack_s: 0.01,
-            decay_s: 0.15,
-            points: vec![(-80.0, -80.0), (-18.0, -18.0), (0.0, -2.5)],
-            soft_knee: 6.0,
-            delay_s: 0.01,
+            attack_s: 0.005,
+            decay_s: 0.1,
+            points: vec![(-80.0, -80.0), (-6.0, -6.0), (0.0, -1.0)],
+            soft_knee: 3.0,
+            delay_s: 0.005,
         },
         loudnorm: Loudnorm {
             integrated_lufs: -16.0,
-            range_lu: 11.0,
+            range_lu: 14.0,
             true_peak_dbtp: -1.5,
         },
     }
@@ -306,43 +253,76 @@ loudnorm=I=-16:LRA=10:TP=-2"
     }
 
     #[test]
-    fn hifi_default_is_a_nine_band_proportional_q_eq_without_spatial_effects() {
+    fn hifi_default_is_a_transparent_reference_path() {
         let filter = default_hifi_profile().render();
-        assert!(filter.contains("f=60 w=50 g=0.8"), "sub-bass");
-        assert!(filter.contains("f=120 w=100 g=0.4"), "bass");
-        assert!(filter.contains("f=250 w=180 g=-0.5"), "mid-bass cut");
-        assert!(filter.contains("f=500 w=350 g=0.3"), "low-mid");
-        assert!(filter.contains("f=2000 w=1400 g=0.2"), "mid");
-        assert!(filter.contains("f=5500 w=3500 g=-0.4"), "upper-mid cut");
-        assert!(filter.contains("f=8000 w=5500 g=0.4"), "presence lift");
-        assert!(filter.contains("f=11000 w=7500 g=0.3"), "upper-presence");
-        assert!(filter.contains("f=14000 w=9500 g=0.2"), "air lift");
+        assert!(
+            !filter.contains("anequalizer="),
+            "Hi-Fi must stay uncoloured (no EQ bands): {filter}"
+        );
         assert!(!filter.contains("asubboost"));
         assert!(!filter.contains("extrastereo"));
         assert!(!filter.contains("aecho"));
-        assert!(filter.contains("loudnorm=I=-16"), "loudness target");
+        assert!(filter.contains("lowpass=f=17500"), "bandwidth guard");
+        assert!(
+            filter.contains(
+                "compand=attacks=0.005:decays=0.1:points=-80/-80|-6/-6|0/-1:soft-knee=3:delay=0.005"
+            ),
+            "transparent peak protection: {filter}"
+        );
+        assert!(
+            filter.contains("loudnorm=I=-16:LRA=14:TP=-1.5"),
+            "wide-dynamics loudness target: {filter}"
+        );
     }
 
     #[test]
     fn resample_and_lowpass_are_placed_in_signal_flow_order() {
-        // aresample leads the whole chain (no pre-gain stage); lowpass sits
-        // right after the EQ bands, ahead of compand/loudnorm -- see
-        // `EqProfile::render`.
+        // aresample leads the whole chain (no pre-gain stage); with no EQ
+        // bands, lowpass sits directly after it, ahead of compand/loudnorm --
+        // see `EqProfile::render`.
         let filter = default_hifi_profile().render();
         assert!(
             filter.starts_with("aresample=48000:resampler=swr:precision=28:cutoff=0.97,"),
             "resample leads: {filter}"
         );
 
-        let anequalizer_idx = filter.find("anequalizer=").expect("has EQ bands");
-        let lowpass_idx = filter.find("lowpass=f=18000").expect("has lowpass");
+        let lowpass_idx = filter.find("lowpass=f=17500").expect("has lowpass");
         let compand_idx = filter.find("compand=").expect("has compand");
+        let loudnorm_idx = filter.find("loudnorm=").expect("has loudnorm");
         assert!(
-            anequalizer_idx < lowpass_idx && lowpass_idx < compand_idx,
-            "expected anequalizer -> lowpass -> compand order, got: {filter}"
+            lowpass_idx < compand_idx && compand_idx < loudnorm_idx,
+            "expected lowpass -> compand -> loudnorm order, got: {filter}"
         );
+        assert!(!filter.contains("anequalizer="), "no EQ stage: {filter}");
 
         // Balanced has no lowpass configured, so it must not appear at all.
         assert!(!balanced_profile().render().contains("lowpass"));
+    }
+
+    #[test]
+    fn default_hifi_filtergraph_is_accepted_by_ffmpeg() {
+        let filter = default_hifi_profile().render();
+        let output = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:duration=0.2",
+                "-af",
+                &filter,
+                "-f",
+                "null",
+                "-",
+            ])
+            .output()
+            .expect("spawn ffmpeg");
+        assert!(
+            output.status.success(),
+            "ffmpeg rejected the Hi-Fi filtergraph: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
