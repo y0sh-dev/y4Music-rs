@@ -18,6 +18,18 @@ use crate::commands::profile::load_or_create_raw;
 use crate::player::{PanelUpdater, PanelUpdaterKind, TrackMeta, derive_youtube_thumbnail};
 use crate::{Context, Error};
 
+/// How many tracks `enqueue_multiple_known` adds between `Call` lock releases,
+/// so a 1000-track playlist import does not starve `/seek` or panel refreshes.
+const ENQUEUE_LOCK_CHUNK: usize = 32;
+
+/// Splits `len` tracks into `ENQUEUE_LOCK_CHUNK`-sized index ranges. Split out
+/// so the batching itself is unit-testable.
+fn enqueue_chunks(len: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+    (0..len)
+        .step_by(ENQUEUE_LOCK_CHUNK)
+        .map(move |start| start..(start + ENQUEUE_LOCK_CHUNK).min(len))
+}
+
 /// A user's saved playback settings, resolved in one DB round-trip.
 struct PlaybackProfile {
     /// `0.0 ..= 2.0` fraction `Track::volume` expects (100% == `1.0`).
@@ -293,31 +305,43 @@ pub(crate) async fn enqueue_multiple_known(
     let extra_args = &ctx.data().ytdlp_extra_args;
     let requester_name = ctx.author().display_name().to_string();
 
-    let mut call = call.lock().await;
-    for track in tracks {
-        let source = FfmpegEqSource {
-            url: track.url.clone(),
-            ytdlp_extra_args: extra_args.clone(),
-            eq_filter: profile.eq_filter.clone(),
-            seek_time: None,
-            resolved_stream: None,
-        };
-        let meta = Arc::new(TrackMeta {
-            title: track.title.clone(),
-            url: track.url.clone(),
-            requested_by,
-            duration: (track.duration > 0).then(|| Duration::from_secs(track.duration as u64)),
-            eq_filter: profile.eq_filter.clone(),
-            resolved_stream: None,
-            thumbnail: derive_youtube_thumbnail(&track.url),
-            uploader: track.uploader.clone(),
-            requester_name: requester_name.clone(),
-            start_offset: Duration::ZERO,
-            is_seek: false,
-            is_loop_clone: false,
-        });
-        let built = Track::new_with_data(source.into(), meta).volume(profile.volume);
-        call.enqueue(built).await;
+    for range in enqueue_chunks(tracks.len()) {
+        // Build this batch (and its metadata clones) before taking the lock.
+        let built: Vec<Track> = tracks[range]
+            .iter()
+            .map(|track| {
+                let source = FfmpegEqSource {
+                    url: track.url.clone(),
+                    ytdlp_extra_args: extra_args.clone(),
+                    eq_filter: profile.eq_filter.clone(),
+                    seek_time: None,
+                    resolved_stream: None,
+                };
+                let meta = Arc::new(TrackMeta {
+                    title: track.title.clone(),
+                    url: track.url.clone(),
+                    requested_by,
+                    duration: (track.duration > 0)
+                        .then(|| Duration::from_secs(track.duration as u64)),
+                    eq_filter: profile.eq_filter.clone(),
+                    resolved_stream: None,
+                    thumbnail: derive_youtube_thumbnail(&track.url),
+                    uploader: track.uploader.clone(),
+                    requester_name: requester_name.clone(),
+                    start_offset: Duration::ZERO,
+                    is_seek: false,
+                    is_loop_clone: false,
+                });
+                Track::new_with_data(source.into(), meta).volume(profile.volume)
+            })
+            .collect();
+
+        // Release the lock between batches so panel refreshes and seeks are
+        // not starved for the whole playlist import.
+        let mut call_lock = call.lock().await;
+        for built_track in built {
+            call_lock.enqueue(built_track).await;
+        }
     }
     Ok(())
 }
@@ -914,4 +938,23 @@ pub async fn nowplaying(ctx: Context<'_>) -> Result<(), Error> {
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ENQUEUE_LOCK_CHUNK, enqueue_chunks};
+
+    #[test]
+    fn enqueue_chunks_splits_without_gaps_or_duplicates() {
+        assert_eq!(
+            enqueue_chunks(70).collect::<Vec<_>>(),
+            vec![
+                0..ENQUEUE_LOCK_CHUNK,
+                ENQUEUE_LOCK_CHUNK..2 * ENQUEUE_LOCK_CHUNK,
+                2 * ENQUEUE_LOCK_CHUNK..70
+            ]
+        );
+        assert_eq!(enqueue_chunks(ENQUEUE_LOCK_CHUNK).count(), 1);
+        assert!(enqueue_chunks(0).next().is_none());
+    }
 }
